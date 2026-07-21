@@ -38,4 +38,8 @@
 
 당연히 이 모든 돈은 각 플레이어가 공유하는 돈이야. 예를들어 A플레이어가 15원을 모으고 B플레이어가 5원을 모았으면 총 20원이 모인거지 통장잔고에.
 
+각 아이템 스폰확률은 등급별로 나눌건데 common, normal, rare, unique, regendary 이렇게 총 5단계로 나눌거고 common은 나뭇가지와 돌, 소라고동, normal은 망원경, 빙봉, 나팔, 플라잉 디스크 rare는 가이드북, 스크롤, unique는 괴상버섯, regendary는 이상한 보석으로 해줘.
+업그레이드 등급이 있는데 초기 등급은 common 100% 나머지는 0%로 설정해줘.
+업그레이드를 올리면 올릴수록 다음 등급이 열리는거고, 다음 등급이 열려야 regendary아이템인 이상한 보석을 얻을 수 있도록 바꿔줘.
+
 코드를 개발할 떄는 항상 개발자명은 Sapphire009이고 모드 버전은 1.0.1로 통일해. 프로젝트 이름은 Craft PEAK고 각 cs는 1번째 Delete.cs, 2번째 Spawn.cs, 3번째 LongE.cs, 4번째,Open.cs, 5번째는 Campfire.cs, 6번째는 Inventory.cs로 할 예정이야.
