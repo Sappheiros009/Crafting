@@ -1,4 +1,4 @@
-// CRAFT PEAK UNIFIED HUB - FULL INTEGRATED BUILD 2.0.0
+// CRAFT PEAK UNIFIED HUB - PROGRESSION ON-DEMAND BUILD 2.2.1
 //
 // Developer: Sapphire009
 // Project: Craft PEAK
@@ -6,9 +6,11 @@
 // P키 하나로 통합 메뉴를 엽니다.
 //
 // 좌측 탭
+// - 설명
 // - 강화
 // - 제작
 // - 판매
+// - 부품
 //
 // 이 파일 하나가 기존 Open/Shop.cs, Store.cs, Upgrade.cs의 기능을 모두 포함합니다.
 // 기존 세 파일은 프로젝트에서 제거해야 합니다.
@@ -20,6 +22,18 @@
 // - 자원 등급, 채집 속도, 적재량, 모닥불 효율, 수집량 2배 강화
 // - 강화 상태 Photon Room Property 저장 및 호스트 승계
 // - P키 통합 UI
+// - 비행기 부품 구매와 세그먼트별 모닥불 진행 조건
+// - 정상에서 조명탄 제작 시 최종 탈출 신호를 완성하는 트리거
+//
+// 성능 최적화
+// - P 메뉴가 닫혀 있을 때는 배경 폴링으로 돈/제작식/파티 인벤토리/강화/부품을 읽지 않습니다.
+// - P 입력, 탭 전환, 버튼 입력, 실제 네트워크 결과가 발생했을 때만 필요한 화면을 갱신합니다.
+// - 모닥불 점화·제작·판매·강화 같은 실제 게임 요청은 호스트 검증에 필요한 상태만 즉시 읽습니다.
+// - 제작 재료 합계 1초 캐시 및 StringBuilder 재사용
+// - 텍스트 전용 8행 UI: 아이콘/RawImage/카드 패널을 제거했습니다.
+// - PEAK GUIManager의 기존 TMP 폰트를 한 번만 찾아 캐시합니다.
+// - FindAnyObjectByType / Resources.FindObjectsOfTypeAll 반복 검색을 제거했습니다.
+// - UI 텍스트와 활성 상태가 실제로 바뀔 때만 Canvas를 더럽힙니다.
 //
 // Delete.cs가 같은 어셈블리를 PatchAll하므로 별도의 Harmony.PatchAll 호출은 없습니다.
 // 리플렉션을 사용하지 않습니다.
@@ -33,6 +47,7 @@ using Photon.Pun;
 using Photon.Realtime;
 using System;
 using System.Collections.Generic;
+using System.Text;
 using TMPro;
 using UnityEngine;
 using UnityEngine.Events;
@@ -65,7 +80,7 @@ namespace CraftPeak
             "Craft PEAK Unified Hub";
 
         public const string PluginVersion =
-            "2.0.1";
+            "2.2.1";
 
         public const string DeveloperName =
             "Sapphire009";
@@ -80,8 +95,33 @@ namespace CraftPeak
         private const byte UpgradeRequestEventCode = 225;
         private const byte UpgradeResultEventCode = 226;
 
+        private const byte PartPurchaseRequestEventCode = 227;
+        private const byte PartPurchaseResultEventCode = 228;
+        private const byte ProgressionNoticeEventCode = 229;
+        private const byte FinalFlareCompletedEventCode = 230;
+
         private const string SharedMoneyKey =
             "CraftPeak.SharedMoney";
+
+        private const string PartsProtocolKey =
+            "CraftPeak.Parts.Protocol";
+
+        private const string PartsRevisionKey =
+            "CraftPeak.Parts.Revision";
+
+        private const string PartsRunIdKey =
+            "CraftPeak.Parts.RunId";
+
+        private const string PartsPurchasedMaskKey =
+            "CraftPeak.Parts.PurchasedMask";
+
+        private const string PartsConsumedMaskKey =
+            "CraftPeak.Parts.ConsumedMask";
+
+        private const string PeakUnlockedKey =
+            "CraftPeak.Parts.PeakUnlocked";
+
+        private const int PartsProtocolVersion = 1;
 
 
         private const string RunIdKey =
@@ -132,8 +172,7 @@ namespace CraftPeak
         private const int YieldUpgradeMaximum = 1;
 
         private const double MinimumRequestIntervalSeconds = 0.25d;
-        private const float UpgradePollIntervalSeconds = 0.50f;
-        private const float GameplayInitializationDelaySeconds = 1f;
+        private const float PartyResourceCacheSeconds = 1.00f;
 
         private static readonly float[] GatherTimeFactors =
         {
@@ -187,8 +226,7 @@ namespace CraftPeak
 
         private const float RequestTimeoutSeconds = 6f;
 
-        private const int CraftRecipesPerPage = 12;
-        private const int CraftRecipeColumns = 3;
+        private const int CraftRecipesPerPage = 8;
         private const int MaximumVisibleInventorySlots = 8;
 
         private const ushort FireWoodItemId = 28;
@@ -207,6 +245,7 @@ namespace CraftPeak
         private const ushort StrangeGemItemId = 112;
 
         private const ushort TorchItemId = 109;
+        private const ushort FlareItemId = 32;
 
         private static readonly ushort[] SaleResourceIds =
         {
@@ -244,6 +283,52 @@ namespace CraftPeak
             ScrollItemId
         };
 
+        private static readonly PlanePartRecipe[] PlanePartRecipes =
+        {
+            new PlanePartRecipe(
+                0,
+                "연료 제어 모듈",
+                "해안 → 열대/뿌리숲",
+                1,
+                30,
+                new IngredientCost(FireWoodItemId, 6),
+                new IngredientCost(StoneItemId, 4),
+                new IngredientCost(ConchItemId, 2)),
+
+            new PlanePartRecipe(
+                1,
+                "날개 연결 모듈",
+                "열대/뿌리숲 → 메사/고산지대",
+                2,
+                70,
+                new IngredientCost(BinocularsItemId, 2),
+                new IngredientCost(BugleItemId, 2),
+                new IngredientCost(FrisbeeItemId, 2),
+                new IngredientCost(GuidebookItemId, 1)),
+
+            new PlanePartRecipe(
+                2,
+                "고도 조절 모듈",
+                "메사/고산지대 → 칼데라",
+                3,
+                140,
+                new IngredientCost(GuidebookItemId, 2),
+                new IngredientCost(ScrollItemId, 2),
+                new IngredientCost(WeirdShroomItemId, 1),
+                new IngredientCost(StoneItemId, 4)),
+
+            new PlanePartRecipe(
+                3,
+                "내열 추진 모듈",
+                "칼데라 → 가마",
+                4,
+                280,
+                new IngredientCost(GuidebookItemId, 3),
+                new IngredientCost(ScrollItemId, 3),
+                new IngredientCost(WeirdShroomItemId, 2),
+                new IngredientCost(StrangeGemItemId, 1))
+        };
+
         private readonly List<CraftRecipe> craftRecipes =
             new List<CraftRecipe>();
 
@@ -263,10 +348,14 @@ namespace CraftPeak
             lastUpgradeRequestAtByActor =
                 new Dictionary<int, double>();
 
+        private readonly Dictionary<int, double>
+            lastPartRequestAtByActor =
+                new Dictionary<int, double>();
+
         private CraftHubWindow activeWindow;
 
         private HubTab currentTab =
-            HubTab.Upgrade;
+            HubTab.Description;
 
         private UpgradeKind selectedUpgradeKind =
             UpgradeKind.ResourceGrade;
@@ -274,6 +363,7 @@ namespace CraftPeak
         private int selectedCraftRecipeIndex = -1;
         private int craftPage;
         private int selectedSellSlotId = -1;
+        private int selectedPartIndex;
 
         private PendingRequest pendingRequest =
             PendingRequest.None;
@@ -290,8 +380,26 @@ namespace CraftPeak
         private bool gameplayScene;
         private bool pendingFreshUpgradeRun = true;
 
-        private float nextUpgradePollAt;
-        private float gameplaySceneEnteredAt;
+        private float partyResourceCacheUntil;
+
+        private readonly Dictionary<ushort, int>
+            cachedPartyResourceCounts =
+                new Dictionary<ushort, int>();
+
+        private readonly StringBuilder
+            sharedTextBuilder =
+                new StringBuilder(384);
+
+        private static TMP_FontAsset cachedFontAsset;
+
+        private int partsRevision;
+        private string partsRunId = string.Empty;
+        private int purchasedPartsMask;
+        private int consumedPartsMask;
+        private bool peakUnlocked;
+        private bool partsStateLoaded;
+        private bool upgradeRoomStateDirty = true;
+        private bool partsRoomStateDirty = true;
 
         private int lastAppliedUpgradeRevision = -1;
         private string lastAppliedUpgradeRunId =
@@ -323,6 +431,9 @@ namespace CraftPeak
         private string sellStatus =
             "판매할 인벤토리 슬롯을 선택하세요.";
 
+        private string partsStatus =
+            "현재 세그먼트에 필요한 비행기 부품을 구매하세요.";
+
         internal static CraftHub Instance
         {
             get;
@@ -337,9 +448,11 @@ namespace CraftPeak
 
         internal enum HubTab
         {
-            Upgrade = 0,
-            Craft = 1,
-            Sell = 2
+            Description = 0,
+            Upgrade = 1,
+            Craft = 2,
+            Sell = 3,
+            Parts = 4
         }
 
         internal enum PendingRequest
@@ -347,7 +460,8 @@ namespace CraftPeak
             None = 0,
             Sell = 1,
             Craft = 2,
-            Upgrade = 3
+            Upgrade = 3,
+            Parts = 4
         }
 
         internal enum RecipeTier
@@ -394,6 +508,37 @@ namespace CraftPeak
             public readonly List<IngredientCost>
                 Ingredients =
                     new List<IngredientCost>();
+        }
+
+        private sealed class PlanePartRecipe
+        {
+            public int Index;
+            public string Name;
+            public string Route;
+            public int RequiredResourceLevel;
+            public int MoneyCost;
+            public readonly List<IngredientCost> Ingredients =
+                new List<IngredientCost>();
+
+            public PlanePartRecipe(
+                int index,
+                string name,
+                string route,
+                int requiredResourceLevel,
+                int moneyCost,
+                params IngredientCost[] ingredients)
+            {
+                Index = index;
+                Name = name ?? string.Empty;
+                Route = route ?? string.Empty;
+                RequiredResourceLevel = Mathf.Clamp(requiredResourceLevel, 1, 4);
+                MoneyCost = Mathf.Max(0, moneyCost);
+
+                if (ingredients != null)
+                {
+                    Ingredients.AddRange(ingredients);
+                }
+            }
         }
 
 
@@ -688,12 +833,10 @@ namespace CraftPeak
 
             CloseHub();
 
-            craftRecipes.Clear();
-            craftRecipesByOutputId.Clear();
-
             lastSellRequestAtByActor.Clear();
             lastCraftRequestAtByActor.Clear();
             lastUpgradeRequestAtByActor.Clear();
+            lastPartRequestAtByActor.Clear();
 
             if (Instance == this)
             {
@@ -707,16 +850,10 @@ namespace CraftPeak
 
         private void Update()
         {
-            RefreshSharedMoneyFromRoom();
-            InitializeRunMoneyIfNeeded();
-            PollUpgradeState();
+            // 요청 타임아웃과 P키 입력만 매 프레임 확인합니다.
+            // 돈, 제작식, 파티 인벤토리, 강화, 부품 데이터는
+            // P 메뉴를 여는 순간 또는 실제 네트워크 이벤트가 발생했을 때만 읽습니다.
             UpdatePendingRequest();
-
-            if (gameplayScene &&
-                upgradeStateLoaded)
-            {
-                EnsureUpgradeEffectsApplied();
-            }
 
             if (activeWindow != null &&
                 !activeWindow.isOpen)
@@ -740,12 +877,10 @@ namespace CraftPeak
                 return;
             }
 
-            if (!CanOpenHub())
+            if (CanOpenHub())
             {
-                return;
+                OpenHub();
             }
-
-            OpenHub();
         }
 
         private void HandleSceneLoaded(
@@ -756,6 +891,9 @@ namespace CraftPeak
 
             pendingRequest =
                 PendingRequest.None;
+
+            currentTab =
+                HubTab.Description;
 
             selectedUpgradeKind =
                 UpgradeKind.ResourceGrade;
@@ -769,8 +907,8 @@ namespace CraftPeak
             craftPage =
                 0;
 
-            craftRecipes.Clear();
-            craftRecipesByOutputId.Clear();
+            // ItemDatabase 제작식은 첫 P 입력에서 한 번만 만들고
+            // 씬 이동마다 다시 생성하지 않습니다.
 
             upgradeStatus =
                 "강화 항목을 선택하세요.";
@@ -781,15 +919,33 @@ namespace CraftPeak
             sellStatus =
                 "판매할 인벤토리 슬롯을 선택하세요.";
 
+            partsStatus =
+                "현재 세그먼트에 필요한 비행기 부품을 구매하세요.";
+
+            selectedPartIndex =
+                0;
+
+            partsRevision =
+                0;
+
+            partsRunId =
+                string.Empty;
+
+            purchasedPartsMask =
+                0;
+
+            consumedPartsMask =
+                0;
+
+            peakUnlocked =
+                false;
+
             bool excluded =
                 IsExcludedScene(
                     scene);
 
             gameplayScene =
                 !excluded;
-
-            gameplaySceneEnteredAt =
-                Time.unscaledTime;
 
             if (IsAirportScene(
                     scene))
@@ -801,6 +957,15 @@ namespace CraftPeak
                     0;
 
                 pendingFreshUpgradeRun =
+                    true;
+
+                partsStateLoaded =
+                    false;
+
+                upgradeRoomStateDirty =
+                    true;
+
+                partsRoomStateDirty =
                     true;
 
                 RestoreBaseUpgradeEffects();
@@ -820,7 +985,16 @@ namespace CraftPeak
             upgradeStateLoaded =
                 false;
 
-            nextUpgradePollAt =
+            partsStateLoaded =
+                false;
+
+            upgradeRoomStateDirty =
+                true;
+
+            partsRoomStateDirty =
+                true;
+
+            partyResourceCacheUntil =
                 0f;
 
             Logger.LogInfo(
@@ -855,15 +1029,10 @@ namespace CraftPeak
 
         private static bool IsGameplayScene()
         {
-            Scene scene =
-                SceneManager.GetActiveScene();
-
             return
                 !IsExcludedScene(
-                    scene) &&
-                UnityEngine.Object
-                    .FindAnyObjectByType<MapHandler>() !=
-                null;
+                    SceneManager
+                        .GetActiveScene());
         }
 
         private static bool IsAirportScene(
@@ -900,6 +1069,30 @@ namespace CraftPeak
                     StringComparison.OrdinalIgnoreCase);
         }
 
+        private void LoadHubDataOnDemand()
+        {
+            RefreshSharedMoneyFromRoom();
+            InitializeRunMoneyIfNeeded();
+
+            LoadUpgradeStateOnDemand();
+            LoadPartsStateOnDemand();
+
+            int currentSegment =
+                GetCurrentSegmentIndex();
+
+            if (currentSegment >=
+                    (int)Segment.Beach &&
+                currentSegment <=
+                    (int)Segment.Caldera)
+            {
+                selectedPartIndex =
+                    currentSegment;
+            }
+
+            partyResourceCacheUntil =
+                0f;
+        }
+
         private void OpenHub()
         {
             if (activeWindow != null)
@@ -907,7 +1100,7 @@ namespace CraftPeak
                 return;
             }
 
-            EnsureCraftRecipesBuilt();
+            LoadHubDataOnDemand();
 
             GameObject root =
                 new GameObject(
@@ -971,9 +1164,6 @@ namespace CraftPeak
                     0;
             }
 
-            selectedUpgradeKind =
-                UpgradeKind.ResourceGrade;
-
             RefreshWindow();
 
             Logger.LogInfo(
@@ -991,6 +1181,31 @@ namespace CraftPeak
 
             Logger.LogInfo(
                 "Unified hub closed.");
+        }
+
+        /// <summary>
+        /// 기존 Shop/Store/Upgrade 호출부가 통합 허브의 특정 탭을 열 수 있게 하는
+        /// 호환 진입점입니다. 별도 플러그인이나 별도 UI는 생성하지 않습니다.
+        /// </summary>
+        internal void OpenCompatibilityTab(
+            HubTab tab)
+        {
+            currentTab =
+                tab;
+
+            if (activeWindow == null &&
+                CanOpenHub())
+            {
+                OpenHub();
+            }
+
+            SelectTab(
+                tab);
+        }
+
+        internal void RefreshCompatibilityWindow()
+        {
+            RefreshWindow();
         }
 
         private void DestroyHubObject()
@@ -1023,6 +1238,42 @@ namespace CraftPeak
             currentTab =
                 tab;
 
+            if (tab ==
+                HubTab.Craft &&
+                craftRecipes.Count ==
+                    0)
+            {
+                EnsureCraftRecipesBuilt();
+
+                if (selectedCraftRecipeIndex <
+                        0 &&
+                    craftRecipes.Count >
+                        0)
+                {
+                    selectedCraftRecipeIndex =
+                        0;
+                }
+            }
+
+            if (tab ==
+                HubTab.Parts)
+            {
+                int currentSegment =
+                    GetCurrentSegmentIndex();
+
+                if (currentSegment >=
+                        (int)Segment.Beach &&
+                    currentSegment <=
+                        (int)Segment.Caldera)
+                {
+                    selectedPartIndex =
+                        currentSegment;
+                }
+            }
+
+            partyResourceCacheUntil =
+                0f;
+
             RefreshWindow();
         }
 
@@ -1046,7 +1297,8 @@ namespace CraftPeak
         {
             get
             {
-                return ReadSharedMoney();
+                return
+                    cachedSharedMoney;
             }
         }
 
@@ -1071,6 +1323,12 @@ namespace CraftPeak
 
                 case HubTab.Sell:
                     return sellStatus;
+
+                case HubTab.Parts:
+                    return partsStatus;
+
+                case HubTab.Description:
+                    return string.Empty;
 
                 default:
                     return string.Empty;
@@ -1099,6 +1357,11 @@ namespace CraftPeak
 
                 case HubTab.Sell:
                     sellStatus =
+                        safe;
+                    break;
+
+                case HubTab.Parts:
+                    partsStatus =
                         safe;
                     break;
             }
@@ -1196,6 +1459,65 @@ namespace CraftPeak
                 HandleUpgradeResult(
                     photonEvent.CustomData as
                         object[]);
+
+                return;
+            }
+
+            if (photonEvent.Code ==
+                PartPurchaseRequestEventCode)
+            {
+                if (PhotonNetwork.IsMasterClient)
+                {
+                    ProcessPartPurchaseRequestOnHost(
+                        photonEvent.Sender,
+                        photonEvent.CustomData as
+                            object[]);
+                }
+
+                return;
+            }
+
+            if (photonEvent.Code ==
+                PartPurchaseResultEventCode)
+            {
+                HandlePartPurchaseResult(
+                    photonEvent.CustomData as
+                        object[]);
+
+                return;
+            }
+
+            if (photonEvent.Code ==
+                ProgressionNoticeEventCode)
+            {
+                object[] payload =
+                    photonEvent.CustomData as
+                        object[];
+
+                string message =
+                    payload != null &&
+                    payload.Length >
+                        0
+                        ? payload[0] as
+                            string
+                        : null;
+
+                CampfireGate.NotifyLocalPlayer(
+                    string.IsNullOrEmpty(
+                        message)
+                        ? "진행 조건을 확인하세요."
+                        : message);
+
+                return;
+            }
+
+            if (photonEvent.Code ==
+                FinalFlareCompletedEventCode)
+            {
+                CloseHub();
+
+                CampfireGate.NotifyLocalPlayer(
+                    "정상에서 최종 조명탄 제작 완료. 탈출 신호를 발사했습니다.");
             }
         }
 
@@ -1240,6 +1562,9 @@ namespace CraftPeak
                 case PendingRequest.Upgrade:
                     return HubTab.Upgrade;
 
+                case PendingRequest.Parts:
+                    return HubTab.Parts;
+
                 default:
                     return HubTab.Upgrade;
             }
@@ -1250,6 +1575,9 @@ namespace CraftPeak
         {
             pendingRequest =
                 PendingRequest.None;
+
+            partyResourceCacheUntil =
+                0f;
 
             if (resultData == null ||
                 resultData.Length <
@@ -1322,6 +1650,9 @@ namespace CraftPeak
         {
             pendingRequest =
                 PendingRequest.None;
+
+            partyResourceCacheUntil =
+                0f;
 
             if (resultData == null ||
                 resultData.Length <
@@ -1410,7 +1741,7 @@ namespace CraftPeak
                 !PhotonNetwork.InRoom ||
                 PhotonNetwork.CurrentRoom ==
                     null ||
-                !IsGameplayScene())
+                !gameplayScene)
             {
                 return;
             }
@@ -1541,6 +1872,1452 @@ namespace CraftPeak
                     safeMoney;
 
                 Instance.RefreshWindow();
+            }
+        }
+
+        // -----------------------------------------------------------------
+        // On-demand progression / airplane parts
+        // -----------------------------------------------------------------
+
+        private void LoadPartsStateOnDemand()
+        {
+            partsRoomStateDirty =
+                false;
+
+            if (!PhotonNetwork.InRoom ||
+                PhotonNetwork.CurrentRoom == null)
+            {
+                return;
+            }
+
+            ExitGames.Client.Photon.Hashtable
+                properties =
+                    PhotonNetwork.CurrentRoom
+                        .CustomProperties;
+
+            string currentRunId =
+                ReadRunId();
+
+            object protocolValue = null;
+            object revisionValue = null;
+
+            bool found =
+                properties.TryGetValue(
+                    PartsProtocolKey,
+                    out protocolValue) &&
+                properties.TryGetValue(
+                    PartsRevisionKey,
+                    out revisionValue);
+
+            if (!found)
+            {
+                if (PhotonNetwork.IsMasterClient)
+                {
+                    PublishPartsState(
+                        0,
+                        0,
+                        false,
+                        currentRunId,
+                        "Fresh parts state");
+                }
+                else
+                {
+                    partsRevision =
+                        0;
+
+                    partsRunId =
+                        currentRunId;
+
+                    purchasedPartsMask =
+                        0;
+
+                    consumedPartsMask =
+                        0;
+
+                    peakUnlocked =
+                        false;
+
+                    partsStateLoaded =
+                        true;
+                }
+
+                return;
+            }
+
+            try
+            {
+                int protocol =
+                    Convert.ToInt32(
+                        protocolValue);
+
+                if (protocol !=
+                    PartsProtocolVersion)
+                {
+                    Logger.LogError(
+                        "Parts protocol mismatch. Room=" +
+                        protocol +
+                        " | Local=" +
+                        PartsProtocolVersion);
+
+                    return;
+                }
+
+                string roomRunId =
+                    ReadString(
+                        properties,
+                        PartsRunIdKey);
+
+                bool runChanged =
+                    !string.IsNullOrEmpty(
+                        currentRunId) &&
+                    !string.Equals(
+                        roomRunId,
+                        currentRunId,
+                        StringComparison.Ordinal);
+
+                if (runChanged)
+                {
+                    if (PhotonNetwork.IsMasterClient)
+                    {
+                        PublishPartsState(
+                            0,
+                            0,
+                            false,
+                            currentRunId,
+                            "New run parts reset");
+                    }
+                    else
+                    {
+                        partsRevision =
+                            0;
+
+                        partsRunId =
+                            currentRunId;
+
+                        purchasedPartsMask =
+                            0;
+
+                        consumedPartsMask =
+                            0;
+
+                        peakUnlocked =
+                            false;
+
+                        partsStateLoaded =
+                            true;
+                    }
+
+                    return;
+                }
+
+                partsRevision =
+                    Mathf.Max(
+                        0,
+                        Convert.ToInt32(
+                            revisionValue));
+
+                partsRunId =
+                    string.IsNullOrEmpty(
+                        currentRunId)
+                        ? roomRunId
+                        : currentRunId;
+
+                purchasedPartsMask =
+                    ReadInt(
+                        properties,
+                        PartsPurchasedMaskKey,
+                        0) &
+                    0x0F;
+
+                consumedPartsMask =
+                    ReadInt(
+                        properties,
+                        PartsConsumedMaskKey,
+                        0) &
+                    0x0F;
+
+                peakUnlocked =
+                    ReadBool(
+                        properties,
+                        PeakUnlockedKey,
+                        false);
+
+                partsStateLoaded =
+                    true;
+            }
+            catch (Exception exception)
+            {
+                Logger.LogError(
+                    "Parts state read failed: " +
+                    exception);
+            }
+        }
+
+        private bool PublishPartsState(
+            int purchasedMask,
+            int consumedMask,
+            bool unlockedPeak,
+            string runId,
+            string reason)
+        {
+            if (!PhotonNetwork.InRoom ||
+                !PhotonNetwork.IsMasterClient ||
+                PhotonNetwork.CurrentRoom == null)
+            {
+                return false;
+            }
+
+            int nextRevision =
+                Mathf.Max(
+                    0,
+                    partsRevision) +
+                1;
+
+            string safeRunId =
+                runId ??
+                string.Empty;
+
+            ExitGames.Client.Photon.Hashtable
+                properties =
+                    new ExitGames.Client.Photon.Hashtable
+                    {
+                        {
+                            PartsProtocolKey,
+                            PartsProtocolVersion
+                        },
+                        {
+                            PartsRevisionKey,
+                            nextRevision
+                        },
+                        {
+                            PartsRunIdKey,
+                            safeRunId
+                        },
+                        {
+                            PartsPurchasedMaskKey,
+                            purchasedMask &
+                            0x0F
+                        },
+                        {
+                            PartsConsumedMaskKey,
+                            consumedMask &
+                            0x0F
+                        },
+                        {
+                            PeakUnlockedKey,
+                            unlockedPeak
+                        }
+                    };
+
+            if (!PhotonNetwork.CurrentRoom
+                    .SetCustomProperties(
+                        properties))
+            {
+                Logger.LogError(
+                    "Parts state publish failed. Reason=" +
+                    reason);
+
+                return false;
+            }
+
+            partsRevision =
+                nextRevision;
+
+            partsRunId =
+                safeRunId;
+
+            purchasedPartsMask =
+                purchasedMask &
+                0x0F;
+
+            consumedPartsMask =
+                consumedMask &
+                0x0F;
+
+            peakUnlocked =
+                unlockedPeak;
+
+            partsStateLoaded =
+                true;
+
+            partsRoomStateDirty =
+                false;
+
+            RefreshWindow();
+
+            Logger.LogInfo(
+                "Parts state published. Reason=" +
+                reason +
+                " | PurchasedMask=" +
+                purchasedPartsMask +
+                " | ConsumedMask=" +
+                consumedPartsMask +
+                " | PeakUnlocked=" +
+                peakUnlocked +
+                ".");
+
+            return true;
+        }
+
+        private PlanePartRecipe SelectedPartRecipe
+        {
+            get
+            {
+                return
+                    selectedPartIndex >=
+                        0 &&
+                    selectedPartIndex <
+                        PlanePartRecipes.Length
+                        ? PlanePartRecipes[
+                            selectedPartIndex]
+                        : null;
+            }
+        }
+
+        internal void SelectPart(
+            int partIndex)
+        {
+            if (partIndex <
+                    0 ||
+                partIndex >=
+                    PlanePartRecipes.Length)
+            {
+                return;
+            }
+
+            selectedPartIndex =
+                partIndex;
+
+            SetTabStatus(
+                HubTab.Parts,
+                PlanePartRecipes[
+                    partIndex]
+                    .Name +
+                "을(를) 선택했습니다.");
+        }
+
+        private string BuildPartRowText(
+            int partIndex)
+        {
+            if (partIndex <
+                    0 ||
+                partIndex >=
+                    PlanePartRecipes.Length)
+            {
+                return string.Empty;
+            }
+
+            PlanePartRecipe recipe =
+                PlanePartRecipes[
+                    partIndex];
+
+            int bit =
+                1 <<
+                partIndex;
+
+            string stateText =
+                (consumedPartsMask &
+                    bit) !=
+                    0
+                    ? "사용 완료"
+                    : (
+                        (purchasedPartsMask &
+                            bit) !=
+                            0
+                            ? "보유 중"
+                            : "미구매"
+                    );
+
+            return
+                (partIndex + 1) +
+                ". " +
+                recipe.Name +
+                "  |  " +
+                recipe.Route +
+                "  |  " +
+                stateText;
+        }
+
+        private string BuildPartDetailText(
+            PlanePartRecipe recipe,
+            out bool ready)
+        {
+            ready =
+                false;
+
+            if (recipe == null)
+            {
+                return
+                    "구매할 비행기 부품을 선택하세요.";
+            }
+
+            Dictionary<ushort, int>
+                counts =
+                    GetCachedPartyResourceCounts();
+
+            int currentSegment =
+                GetCurrentSegmentIndex();
+
+            int currentGrade =
+                GetCurrentResourceLevel();
+
+            int bit =
+                1 <<
+                recipe.Index;
+
+            bool purchased =
+                (purchasedPartsMask &
+                    bit) !=
+                    0;
+
+            bool consumed =
+                (consumedPartsMask &
+                    bit) !=
+                    0;
+
+            bool correctSegment =
+                currentSegment ==
+                    recipe.Index;
+
+            bool gradeReady =
+                currentGrade >=
+                    recipe.RequiredResourceLevel;
+
+            bool moneyReady =
+                cachedSharedMoney >=
+                    recipe.MoneyCost;
+
+            bool materialsReady =
+                true;
+
+            sharedTextBuilder.Length =
+                0;
+
+            sharedTextBuilder.Append(
+                recipe.Name);
+
+            sharedTextBuilder.Append(
+                "\n");
+
+            sharedTextBuilder.Append(
+                recipe.Route);
+
+            sharedTextBuilder.Append(
+                "\n\n필요 제작 등급: ");
+
+            sharedTextBuilder.Append(
+                GetResourceGradeName(
+                    recipe.RequiredResourceLevel));
+
+            sharedTextBuilder.Append(
+                gradeReady
+                    ? "  <color=#79E081>충족</color>"
+                    : "  <color=#FF8A80>미충족</color>");
+
+            sharedTextBuilder.Append(
+                "\n\n재료");
+
+            for (int i = 0;
+                 i <
+                     recipe.Ingredients.Count;
+                 i++)
+            {
+                IngredientCost cost =
+                    recipe.Ingredients[i];
+
+                int available;
+
+                counts.TryGetValue(
+                    cost.ItemId,
+                    out available);
+
+                bool enough =
+                    available >=
+                    cost.Count;
+
+                materialsReady &=
+                    enough;
+
+                sharedTextBuilder.Append(
+                    "\n");
+
+                sharedTextBuilder.Append(
+                    enough
+                        ? "<color=#79E081>"
+                        : "<color=#FF8A80>");
+
+                sharedTextBuilder.Append(
+                    GetIngredientDisplayName(
+                        cost.ItemId));
+
+                sharedTextBuilder.Append(
+                    " ");
+
+                sharedTextBuilder.Append(
+                    available);
+
+                sharedTextBuilder.Append(
+                    "/");
+
+                sharedTextBuilder.Append(
+                    cost.Count);
+
+                sharedTextBuilder.Append(
+                    "</color>");
+            }
+
+            sharedTextBuilder.Append(
+                "\n");
+
+            sharedTextBuilder.Append(
+                moneyReady
+                    ? "<color=#79E081>"
+                    : "<color=#FF8A80>");
+
+            sharedTextBuilder.Append(
+                "공유 돈 ");
+
+            sharedTextBuilder.Append(
+                cachedSharedMoney);
+
+            sharedTextBuilder.Append(
+                "/");
+
+            sharedTextBuilder.Append(
+                recipe.MoneyCost);
+
+            sharedTextBuilder.Append(
+                "원</color>");
+
+            sharedTextBuilder.Append(
+                "\n\n상태: ");
+
+            if (consumed)
+            {
+                sharedTextBuilder.Append(
+                    "이전 모닥불에서 사용 완료");
+            }
+            else if (purchased)
+            {
+                sharedTextBuilder.Append(
+                    "구매 완료 · 모닥불 점화 가능");
+            }
+            else if (!correctSegment)
+            {
+                sharedTextBuilder.Append(
+                    currentSegment <
+                        recipe.Index
+                        ? "아직 도달하지 않은 구간"
+                        : "이미 지난 구간");
+            }
+            else
+            {
+                sharedTextBuilder.Append(
+                    "구매 가능");
+            }
+
+            ready =
+                !purchased &&
+                !consumed &&
+                correctSegment &&
+                gradeReady &&
+                moneyReady &&
+                materialsReady &&
+                pendingRequest ==
+                    PendingRequest.None;
+
+            return
+                sharedTextBuilder
+                    .ToString();
+        }
+
+        private void RequestPartPurchase()
+        {
+            if (pendingRequest !=
+                PendingRequest.None)
+            {
+                SetTabStatus(
+                    HubTab.Parts,
+                    "다른 요청을 처리 중입니다.");
+
+                return;
+            }
+
+            PlanePartRecipe recipe =
+                SelectedPartRecipe;
+
+            bool ready;
+
+            BuildPartDetailText(
+                recipe,
+                out ready);
+
+            if (recipe == null ||
+                !ready)
+            {
+                SetTabStatus(
+                    HubTab.Parts,
+                    "현재 구간, 제작 등급, 재료와 공유 돈을 확인하세요.");
+
+                return;
+            }
+
+            pendingRequest =
+                PendingRequest.Parts;
+
+            requestStartedAt =
+                Time.unscaledTime;
+
+            SetTabStatus(
+                HubTab.Parts,
+                recipe.Name +
+                " 구매를 요청했습니다...");
+
+            object[] payload =
+            {
+                recipe.Index
+            };
+
+            RaiseEventOptions options =
+                new RaiseEventOptions
+                {
+                    Receivers =
+                        ReceiverGroup.MasterClient
+                };
+
+            if (PhotonNetwork.IsMasterClient)
+            {
+                ProcessPartPurchaseRequestOnHost(
+                    LocalActorNumber(),
+                    payload);
+
+                return;
+            }
+
+            bool sent =
+                PhotonNetwork.RaiseEvent(
+                    PartPurchaseRequestEventCode,
+                    payload,
+                    options,
+                    SendOptions.SendReliable);
+
+            if (!sent)
+            {
+                pendingRequest =
+                    PendingRequest.None;
+
+                SetTabStatus(
+                    HubTab.Parts,
+                    "비행기 부품 구매 요청 전송에 실패했습니다.");
+            }
+        }
+
+        private void ProcessPartPurchaseRequestOnHost(
+            int actorNumber,
+            object[] payload)
+        {
+            if (!PhotonNetwork.IsMasterClient)
+            {
+                return;
+            }
+
+            if (payload == null ||
+                payload.Length <
+                    1)
+            {
+                SendPartPurchaseResult(
+                    actorNumber,
+                    false,
+                    "잘못된 비행기 부품 구매 요청입니다.");
+
+                return;
+            }
+
+            double now =
+                PhotonNetwork.Time;
+
+            double previousRequestAt;
+
+            if (lastPartRequestAtByActor
+                    .TryGetValue(
+                        actorNumber,
+                        out previousRequestAt) &&
+                now -
+                    previousRequestAt <
+                MinimumRequestIntervalSeconds)
+            {
+                SendPartPurchaseResult(
+                    actorNumber,
+                    false,
+                    "비행기 부품 구매 요청이 너무 빠릅니다.");
+
+                return;
+            }
+
+            lastPartRequestAtByActor[
+                actorNumber] =
+                    now;
+
+            int partIndex;
+
+            try
+            {
+                partIndex =
+                    Convert.ToInt32(
+                        payload[0]);
+            }
+            catch (Exception)
+            {
+                SendPartPurchaseResult(
+                    actorNumber,
+                    false,
+                    "비행기 부품 번호를 해석하지 못했습니다.");
+
+                return;
+            }
+
+            if (partIndex <
+                    0 ||
+                partIndex >=
+                    PlanePartRecipes.Length)
+            {
+                SendPartPurchaseResult(
+                    actorNumber,
+                    false,
+                    "존재하지 않는 비행기 부품입니다.");
+
+                return;
+            }
+
+            LoadPartsStateOnDemand();
+
+            PlanePartRecipe recipe =
+                PlanePartRecipes[
+                    partIndex];
+
+            int currentSegment =
+                GetCurrentSegmentIndex();
+
+            if (currentSegment !=
+                recipe.Index)
+            {
+                SendPartPurchaseResult(
+                    actorNumber,
+                    false,
+                    "현재 구간에서 필요한 비행기 부품만 구매할 수 있습니다.");
+
+                return;
+            }
+
+            int currentGrade =
+                GetCurrentResourceLevel();
+
+            if (currentGrade <
+                recipe.RequiredResourceLevel)
+            {
+                SendPartPurchaseResult(
+                    actorNumber,
+                    false,
+                    GetResourceGradeName(
+                        recipe.RequiredResourceLevel) +
+                    " 제작 등급이 필요합니다.");
+
+                return;
+            }
+
+            int bit =
+                1 <<
+                recipe.Index;
+
+            if ((purchasedPartsMask &
+                    bit) !=
+                    0 ||
+                (consumedPartsMask &
+                    bit) !=
+                    0)
+            {
+                SendPartPurchaseResult(
+                    actorNumber,
+                    false,
+                    "이미 구매했거나 사용한 비행기 부품입니다.");
+
+                return;
+            }
+
+            int money =
+                ReadSharedMoney();
+
+            if (money <
+                recipe.MoneyCost)
+            {
+                SendPartPurchaseResult(
+                    actorNumber,
+                    false,
+                    "공유 돈이 부족합니다.");
+
+                return;
+            }
+
+            CraftConsumptionPlan plan;
+            string missingMessage;
+
+            if (!TryBuildPartConsumptionPlan(
+                    recipe,
+                    out plan,
+                    out missingMessage))
+            {
+                SendPartPurchaseResult(
+                    actorNumber,
+                    false,
+                    missingMessage);
+
+                return;
+            }
+
+            List<ConsumedSelectedSlot>
+                consumedSlots;
+
+            if (!TryConsumePlan(
+                    plan,
+                    out consumedSlots))
+            {
+                SendPartPurchaseResult(
+                    actorNumber,
+                    false,
+                    "재료 소비 중 인벤토리가 변경되었습니다. 다시 시도하세요.");
+
+                return;
+            }
+
+            SetSharedMoneyOnHost(
+                money -
+                recipe.MoneyCost);
+
+            BroadcastConsumedSelectedSlots(
+                consumedSlots);
+
+            int nextPurchasedMask =
+                purchasedPartsMask |
+                bit;
+
+            if (!PublishPartsState(
+                    nextPurchasedMask,
+                    consumedPartsMask,
+                    peakUnlocked,
+                    ReadRunId(),
+                    "Plane part purchased: " +
+                    recipe.Name))
+            {
+                SetSharedMoneyOnHost(
+                    ReadSharedMoney() +
+                    recipe.MoneyCost);
+
+                SendPartPurchaseResult(
+                    actorNumber,
+                    false,
+                    "부품 상태 저장에 실패했습니다. 공유 돈은 환불되었지만 재료는 복구되지 않았습니다.");
+
+                return;
+            }
+
+            partyResourceCacheUntil =
+                0f;
+
+            SendPartPurchaseResult(
+                actorNumber,
+                true,
+                recipe.Name +
+                " 구매 완료.\n인벤토리에는 들어가지 않으며 모닥불 진행 조건으로 저장됩니다.");
+        }
+
+        private static bool TryBuildPartConsumptionPlan(
+            PlanePartRecipe recipe,
+            out CraftConsumptionPlan plan,
+            out string missingMessage)
+        {
+            CraftRecipe temporaryRecipe =
+                new CraftRecipe();
+
+            for (int i = 0;
+                 i <
+                     recipe.Ingredients.Count;
+                 i++)
+            {
+                IngredientCost cost =
+                    recipe.Ingredients[i];
+
+                temporaryRecipe.Ingredients.Add(
+                    new IngredientCost(
+                        cost.ItemId,
+                        cost.Count));
+            }
+
+            return
+                TryBuildCraftConsumptionPlan(
+                    temporaryRecipe,
+                    out plan,
+                    out missingMessage);
+        }
+
+        private void SendPartPurchaseResult(
+            int targetActor,
+            bool success,
+            string message)
+        {
+            object[] payload =
+            {
+                success,
+                message ??
+                string.Empty,
+                ReadSharedMoney()
+            };
+
+            if (PhotonNetwork.LocalPlayer !=
+                    null &&
+                PhotonNetwork.LocalPlayer.ActorNumber ==
+                    targetActor)
+            {
+                HandlePartPurchaseResult(
+                    payload);
+
+                return;
+            }
+
+            RaiseEventOptions options =
+                new RaiseEventOptions
+                {
+                    TargetActors =
+                        new[]
+                        {
+                            targetActor
+                        }
+                };
+
+            PhotonNetwork.RaiseEvent(
+                PartPurchaseResultEventCode,
+                payload,
+                options,
+                SendOptions.SendReliable);
+        }
+
+        private void HandlePartPurchaseResult(
+            object[] payload)
+        {
+            pendingRequest =
+                PendingRequest.None;
+
+            string message =
+                payload != null &&
+                payload.Length >
+                    1
+                    ? payload[1] as
+                        string
+                    : null;
+
+            if (payload != null &&
+                payload.Length >
+                    2)
+            {
+                try
+                {
+                    cachedSharedMoney =
+                        Mathf.Max(
+                            0,
+                            Convert.ToInt32(
+                                payload[2]));
+                }
+                catch (Exception)
+                {
+                }
+            }
+
+            partyResourceCacheUntil =
+                0f;
+
+            partsRoomStateDirty =
+                true;
+
+            LoadPartsStateOnDemand();
+
+            SetTabStatus(
+                HubTab.Parts,
+                string.IsNullOrEmpty(
+                    message)
+                    ? "비행기 부품 구매 결과를 받았습니다."
+                    : message);
+        }
+
+        internal static bool IsCurrentCampfireRequest(
+            object[] requestData)
+        {
+            if (requestData == null ||
+                requestData.Length <
+                    1)
+            {
+                return false;
+            }
+
+            try
+            {
+                int viewId =
+                    Convert.ToInt32(
+                        requestData[0]);
+
+                PhotonView view =
+                    PhotonView.Find(
+                        viewId);
+
+                global::Campfire requested =
+                    view != null
+                        ? view.GetComponent<
+                            global::Campfire>()
+                        : null;
+
+                return
+                    requested != null &&
+                    IsCurrentSegmentCampfire(
+                        requested);
+            }
+            catch (Exception)
+            {
+                return false;
+            }
+        }
+
+        internal static bool IsCurrentSegmentCampfire(
+            global::Campfire campfire)
+        {
+            if (campfire == null)
+            {
+                return false;
+            }
+
+            try
+            {
+                return
+                    MapHandler.CurrentCampfire ==
+                    campfire;
+            }
+            catch (Exception)
+            {
+                return false;
+            }
+        }
+
+        internal static bool ValidateCampfireProgression(
+            out string message)
+        {
+            message =
+                string.Empty;
+
+            if (Instance == null ||
+                !PhotonNetwork.InRoom ||
+                PhotonNetwork.CurrentRoom == null)
+            {
+                return true;
+            }
+
+            int segment =
+                GetCurrentSegmentIndex();
+
+            if (segment ==
+                (int)Segment.TheKiln)
+            {
+                message =
+                    "가마 구간은 비행기 부품과 모닥불 진행 대상이 아닙니다.\n정상에 도착한 뒤 P 메뉴의 제작 탭에서 최종 조명탄을 제작하세요.";
+
+                return false;
+            }
+
+            if (segment <
+                    (int)Segment.Beach ||
+                segment >
+                    (int)Segment.Caldera)
+            {
+                return true;
+            }
+
+            string currentRunId =
+                ReadRoomString(
+                    RunIdKey);
+
+            string partRunId =
+                ReadRoomString(
+                    PartsRunIdKey);
+
+            if (!string.IsNullOrEmpty(
+                    currentRunId) &&
+                !string.Equals(
+                    currentRunId,
+                    partRunId,
+                    StringComparison.Ordinal))
+            {
+                message =
+                    "새 등반의 비행기 부품 상태가 아직 초기화되지 않았습니다.\nP 메뉴의 부품 탭을 열어 진행 상태를 초기화하세요.";
+
+                return false;
+            }
+
+            int requiredGrade =
+                segment +
+                1;
+
+            int currentGrade =
+                GetCurrentResourceLevel();
+
+            if (currentGrade <
+                requiredGrade)
+            {
+                message =
+                    "모닥불 점화 조건 미충족\n" +
+                    GetResourceGradeName(
+                        requiredGrade) +
+                    " 제작 등급이 필요합니다.";
+
+                return false;
+            }
+
+            int bit =
+                1 <<
+                segment;
+
+            int purchasedMask =
+                ReadRoomInt(
+                    PartsPurchasedMaskKey,
+                    0);
+
+            int consumedMask =
+                ReadRoomInt(
+                    PartsConsumedMaskKey,
+                    0);
+
+            if ((consumedMask &
+                    bit) !=
+                    0)
+            {
+                message =
+                    "이 구간의 비행기 부품은 이미 사용되었습니다.";
+
+                return false;
+            }
+
+            if ((purchasedMask &
+                    bit) ==
+                    0)
+            {
+                message =
+                    "모닥불 점화 조건 미충족\nP 메뉴의 부품 탭에서 현재 구간 비행기 부품을 먼저 구매하세요.";
+
+                return false;
+            }
+
+            return true;
+        }
+
+        internal static string BuildCampfireProgressionPrompt()
+        {
+            if (Instance == null)
+            {
+                return string.Empty;
+            }
+
+            int segment =
+                GetCurrentSegmentIndex();
+
+            if (segment ==
+                (int)Segment.TheKiln)
+            {
+                return
+                    "\n<color=#FFCF66>가마 이후 정상에 도착하면 P → 제작 → 최종 조명탄 제작</color>";
+            }
+
+            if (segment <
+                    (int)Segment.Beach ||
+                segment >
+                    (int)Segment.Caldera)
+            {
+                return string.Empty;
+            }
+
+            int requiredGrade =
+                segment +
+                1;
+
+            int currentGrade =
+                Instance.upgradeState
+                    .ResourceLevel;
+
+            int bit =
+                1 <<
+                segment;
+
+            bool purchased =
+                (Instance.purchasedPartsMask &
+                 bit) !=
+                0;
+
+            bool gradeReady =
+                currentGrade >=
+                    requiredGrade;
+
+            string color =
+                purchased &&
+                gradeReady
+                    ? "#79E081"
+                    : "#FF8A80";
+
+            return
+                "\n<color=" +
+                color +
+                ">진행 조건: " +
+                GetResourceGradeName(
+                    requiredGrade) +
+                " 등급 | 비행기 부품 " +
+                (
+                    purchased
+                        ? "구매 완료"
+                        : "미구매"
+                ) +
+                "</color>";
+        }
+
+        internal void MarkPartConsumedAfterCampfire(
+            int sourceSegment)
+        {
+            if (!PhotonNetwork.IsMasterClient)
+            {
+                return;
+            }
+
+            if (sourceSegment <
+                    (int)Segment.Beach ||
+                sourceSegment >
+                    (int)Segment.Caldera)
+            {
+                return;
+            }
+
+            // Light_Rpc 원본은 다음 세그먼트 전환을 먼저 시작할 수 있으므로,
+            // Postfix에서 현재 세그먼트를 다시 읽지 않고 Prefix가 보존한 출발 구간을 사용합니다.
+            LoadPartsStateOnDemand();
+
+            int bit =
+                1 <<
+                sourceSegment;
+
+            if ((purchasedPartsMask &
+                    bit) ==
+                    0 ||
+                (consumedPartsMask &
+                    bit) !=
+                    0)
+            {
+                return;
+            }
+
+            PublishPartsState(
+                purchasedPartsMask,
+                consumedPartsMask |
+                    bit,
+                peakUnlocked,
+                ReadRunId(),
+                "Campfire consumed plane part for segment " +
+                sourceSegment);
+        }
+
+        internal void SendProgressionNotice(
+            int targetActor,
+            string message)
+        {
+            object[] payload =
+            {
+                message ??
+                string.Empty
+            };
+
+            if (PhotonNetwork.LocalPlayer !=
+                    null &&
+                PhotonNetwork.LocalPlayer.ActorNumber ==
+                    targetActor)
+            {
+                CampfireGate.NotifyLocalPlayer(
+                    message);
+
+                return;
+            }
+
+            RaiseEventOptions options =
+                new RaiseEventOptions
+                {
+                    TargetActors =
+                        new[]
+                        {
+                            targetActor
+                        }
+                };
+
+            PhotonNetwork.RaiseEvent(
+                ProgressionNoticeEventCode,
+                payload,
+                options,
+                SendOptions.SendReliable);
+        }
+
+        private void MarkFinalFlareCompletedAndNotify()
+        {
+            if (!PhotonNetwork.IsMasterClient)
+            {
+                return;
+            }
+
+            LoadPartsStateOnDemand();
+
+            if (!peakUnlocked)
+            {
+                PublishPartsState(
+                    purchasedPartsMask,
+                    consumedPartsMask,
+                    true,
+                    ReadRunId(),
+                    "Final flare crafted at Peak");
+            }
+
+            CloseHub();
+
+            RaiseEventOptions completionOptions =
+                new RaiseEventOptions
+                {
+                    Receivers =
+                        ReceiverGroup.All
+                };
+
+            PhotonNetwork.RaiseEvent(
+                FinalFlareCompletedEventCode,
+                Array.Empty<object>(),
+                completionOptions,
+                SendOptions.SendReliable);
+        }
+
+        private static int GetCurrentSegmentIndex()
+        {
+            try
+            {
+                return
+                    (int)MapHandler
+                        .CurrentSegmentNumber;
+            }
+            catch (Exception)
+            {
+                return -1;
+            }
+        }
+
+        private static int GetCurrentResourceLevel()
+        {
+            if (PhotonNetwork.InRoom &&
+                PhotonNetwork.CurrentRoom !=
+                    null)
+            {
+                return
+                    Mathf.Clamp(
+                        ReadRoomInt(
+                            UpgradeResourceKey,
+                            ResourceUpgradeLevel),
+                        0,
+                        ResourceUpgradeMaximum);
+            }
+
+            return
+                ResourceUpgradeLevel;
+        }
+
+        private static string ReadRoomString(
+            string key)
+        {
+            if (!PhotonNetwork.InRoom ||
+                PhotonNetwork.CurrentRoom ==
+                    null)
+            {
+                return string.Empty;
+            }
+
+            object value;
+
+            if (!PhotonNetwork.CurrentRoom
+                    .CustomProperties
+                    .TryGetValue(
+                        key,
+                        out value) ||
+                value == null)
+            {
+                return string.Empty;
+            }
+
+            return
+                value as string ??
+                Convert.ToString(
+                    value);
+        }
+
+        private static int ReadRoomInt(
+            string key,
+            int fallback)
+        {
+            if (!PhotonNetwork.InRoom ||
+                PhotonNetwork.CurrentRoom ==
+                    null)
+            {
+                return fallback;
+            }
+
+            object value;
+
+            if (!PhotonNetwork.CurrentRoom
+                    .CustomProperties
+                    .TryGetValue(
+                        key,
+                        out value) ||
+                value == null)
+            {
+                return fallback;
+            }
+
+            try
+            {
+                return
+                    Convert.ToInt32(
+                        value);
+            }
+            catch (Exception)
+            {
+                return fallback;
+            }
+        }
+
+        private static bool ReadBool(
+            ExitGames.Client.Photon.Hashtable properties,
+            string key,
+            bool fallback)
+        {
+            object value;
+
+            if (!properties.TryGetValue(
+                    key,
+                    out value) ||
+                value == null)
+            {
+                return fallback;
+            }
+
+            try
+            {
+                return
+                    Convert.ToBoolean(
+                        value);
+            }
+            catch (Exception)
+            {
+                return fallback;
             }
         }
 
@@ -1686,6 +3463,44 @@ namespace CraftPeak
                     Tier =
                         tier
                 };
+
+            if (itemId ==
+                FlareItemId)
+            {
+                recipe.Category =
+                    "최종 탈출";
+
+                recipe.Tier =
+                    RecipeTier.Masterwork;
+
+                recipe.MoneyCost =
+                    500;
+
+                recipe.SuccessChance =
+                    100f;
+
+                AddIngredient(
+                    recipe,
+                    StrangeGemItemId,
+                    2);
+
+                AddIngredient(
+                    recipe,
+                    WeirdShroomItemId,
+                    4);
+
+                AddIngredient(
+                    recipe,
+                    GuidebookItemId,
+                    4);
+
+                AddIngredient(
+                    recipe,
+                    ScrollItemId,
+                    4);
+
+                return recipe;
+            }
 
             if (itemId ==
                 TorchItemId)
@@ -2499,19 +4314,50 @@ namespace CraftPeak
                     "제작식을 선택하세요.";
             }
 
-            Dictionary<ushort, int>
-                counts =
-                    CountPartyResources();
+            if (recipe.OutputItemId ==
+                FlareItemId)
+            {
+                int segment =
+                    GetCurrentSegmentIndex();
 
-            List<string> lines =
-                new List<string>();
+                int grade =
+                    GetCurrentResourceLevel();
+
+                if (segment !=
+                    (int)Segment.Peak)
+                {
+                    return
+                        "<color=#FF8A80>최종 조명탄은 정상 구간에서만 제작할 수 있습니다.</color>";
+                }
+
+                if (grade <
+                    ResourceUpgradeMaximum)
+                {
+                    return
+                        "<color=#FF8A80>Legendary 제작 등급이 필요합니다.</color>";
+                }
+
+                if (peakUnlocked)
+                {
+                    return
+                        "<color=#79E081>최종 조명탄 제작과 탈출 신호 발사가 이미 완료되었습니다.</color>";
+                }
+            }
+
+            Dictionary<ushort, int> counts =
+                GetCachedPartyResourceCounts();
+
+            StringBuilder builder =
+                sharedTextBuilder;
+
+            builder.Length =
+                0;
 
             bool allReady =
                 true;
 
             for (int i = 0;
-                 i <
-                     recipe.Ingredients.Count;
+                 i < recipe.Ingredients.Count;
                  i++)
             {
                 IngredientCost cost =
@@ -2530,23 +4376,40 @@ namespace CraftPeak
                 allReady &=
                     enough;
 
-                lines.Add(
-                    (
-                        enough
-                            ? "<color=#79E081>"
-                            : "<color=#FF8A80>"
-                    ) +
+                if (i >
+                    0)
+                {
+                    builder.Append(
+                        '\n');
+                }
+
+                builder.Append(
+                    enough
+                        ? "<color=#79E081>"
+                        : "<color=#FF8A80>");
+
+                builder.Append(
                     GetIngredientDisplayName(
-                        cost.ItemId) +
-                    " " +
-                    available +
-                    "/" +
-                    cost.Count +
+                        cost.ItemId));
+
+                builder.Append(
+                    ' ');
+
+                builder.Append(
+                    available);
+
+                builder.Append(
+                    '/');
+
+                builder.Append(
+                    cost.Count);
+
+                builder.Append(
                     "</color>");
             }
 
             int money =
-                ReadSharedMoney();
+                cachedSharedMoney;
 
             bool enoughMoney =
                 money >=
@@ -2555,25 +4418,64 @@ namespace CraftPeak
             allReady &=
                 enoughMoney;
 
-            lines.Add(
-                (
-                    enoughMoney
-                        ? "<color=#79E081>"
-                        : "<color=#FF8A80>"
-                ) +
-                "공유 돈 " +
-                money +
-                "/" +
-                recipe.MoneyCost +
+            if (builder.Length >
+                0)
+            {
+                builder.Append(
+                    '\n');
+            }
+
+            builder.Append(
+                enoughMoney
+                    ? "<color=#79E081>"
+                    : "<color=#FF8A80>");
+
+            builder.Append(
+                "공유 돈 ");
+
+            builder.Append(
+                money);
+
+            builder.Append(
+                '/');
+
+            builder.Append(
+                recipe.MoneyCost);
+
+            builder.Append(
                 "원</color>");
 
             ready =
                 allReady;
 
             return
-                string.Join(
-                    "\n",
-                    lines.ToArray());
+                builder.ToString();
+        }
+
+        private Dictionary<ushort, int>
+            GetCachedPartyResourceCounts()
+        {
+            float now =
+                Time.unscaledTime;
+
+            if (now <
+                partyResourceCacheUntil)
+            {
+                return
+                    cachedPartyResourceCounts;
+            }
+
+            cachedPartyResourceCounts.Clear();
+
+            FillPartyResourceCounts(
+                cachedPartyResourceCounts);
+
+            partyResourceCacheUntil =
+                now +
+                PartyResourceCacheSeconds;
+
+            return
+                cachedPartyResourceCounts;
         }
 
         internal void RequestCraft()
@@ -3198,24 +5100,24 @@ namespace CraftPeak
         // Counts and display helpers
         // -----------------------------------------------------------------
 
-        private static Dictionary<ushort, int>
-            CountPartyResources()
+        private static void FillPartyResourceCounts(
+            Dictionary<ushort, int> counts)
         {
-            Dictionary<ushort, int> counts =
-                new Dictionary<ushort, int>();
+            if (counts == null)
+            {
+                return;
+            }
 
             List<Character> characters =
                 PlayerHandler
                     .GetAllPlayerCharacters();
 
             for (int characterIndex = 0;
-                 characterIndex <
-                     characters.Count;
+                 characterIndex < characters.Count;
                  characterIndex++)
             {
                 Character character =
-                    characters[
-                        characterIndex];
+                    characters[characterIndex];
 
                 if (character == null ||
                     character.player == null ||
@@ -3230,12 +5132,10 @@ namespace CraftPeak
                 global::Player player =
                     character.player;
 
-                if (player.itemSlots !=
-                    null)
+                if (player.itemSlots != null)
                 {
                     for (int slotIndex = 0;
-                         slotIndex <
-                             player.itemSlots.Length;
+                         slotIndex < player.itemSlots.Length;
                          slotIndex++)
                     {
                         AddSlotCount(
@@ -3268,21 +5168,18 @@ namespace CraftPeak
                     player.backpackSlot.data
                         .TryGetDataEntry<
                             BackpackData>(
-                            DataEntryKey
-                                .BackpackData,
+                            DataEntryKey.BackpackData,
                             out backpackData);
 
                 if (!hasBackpack ||
                     backpackData == null ||
-                    backpackData.itemSlots ==
-                        null)
+                    backpackData.itemSlots == null)
                 {
                     continue;
                 }
 
                 for (int i = 0;
-                     i <
-                         backpackData.itemSlots.Length;
+                     i < backpackData.itemSlots.Length;
                      i++)
                 {
                     AddSlotCount(
@@ -3293,8 +5190,6 @@ namespace CraftPeak
                         false);
                 }
             }
-
-            return counts;
         }
 
         private static void AddSlotCount(
@@ -3675,58 +5570,114 @@ namespace CraftPeak
 
 
 
-        private void PollUpgradeState()
+        private void LoadUpgradeStateOnDemand()
         {
-            if (Time.unscaledTime <
-                nextUpgradePollAt)
+            upgradeRoomStateDirty =
+                false;
+
+            if (!PhotonNetwork.InRoom ||
+                PhotonNetwork.CurrentRoom == null ||
+                !gameplayScene)
             {
                 return;
             }
 
-            nextUpgradePollAt =
-                Time.unscaledTime +
-                UpgradePollIntervalSeconds;
+            bool found =
+                ReadUpgradeStateFromRoom(
+                    false);
 
-            if (!PhotonNetwork.InRoom ||
-                PhotonNetwork.CurrentRoom == null ||
-                !gameplayScene ||
-                !IsGameplayScene())
-                return;
-
-            bool found = ReadUpgradeStateFromRoom(false);
+            string runId =
+                ReadRunId();
 
             if (!PhotonNetwork.IsMasterClient)
-                return;
+            {
+                if (!found)
+                {
+                    upgradeState =
+                        UpgradeState
+                            .CreateDefault();
 
-            if (Time.unscaledTime - gameplaySceneEnteredAt < GameplayInitializationDelaySeconds)
-                return;
+                    upgradeState.RunId =
+                        runId;
 
-            string runId = ReadRunId();
+                    upgradeState.BaseHoldSeconds =
+                        Mathf.Clamp(
+                            LongE.PickupHoldSeconds,
+                            0.1f,
+                            60f);
+
+                    upgradeState.BaseStackCount =
+                        Mathf.Clamp(
+                            InventoryStack.MaximumStackCount,
+                            1,
+                            100);
+
+                    upgradeState.BaseCampfireMaterials =
+                        new[]
+                        {
+                            Mathf.Max(
+                                0,
+                                CampfireGate.RequiredFireWoodCount),
+
+                            Mathf.Max(
+                                0,
+                                CampfireGate.RequiredStoneCount),
+
+                            Mathf.Max(
+                                0,
+                                CampfireGate.RequiredTorchCount)
+                        };
+
+                    upgradeStateLoaded =
+                        true;
+
+                    ApplyUpgradeEffects(
+                        "Client default state until host initializes room");
+                }
+
+                return;
+            }
 
             bool runChanged =
                 upgradeStateLoaded &&
-                !string.IsNullOrEmpty(runId) &&
-                !string.Equals(upgradeState.RunId, runId, StringComparison.Ordinal);
+                !string.IsNullOrEmpty(
+                    runId) &&
+                !string.Equals(
+                    upgradeState.RunId,
+                    runId,
+                    StringComparison.Ordinal);
 
-            if (!found || !upgradeStateLoaded || runChanged)
+            if (!found ||
+                !upgradeStateLoaded ||
+                runChanged)
             {
                 InitializeFreshState(
-                    string.IsNullOrEmpty(runId)
-                        ? Guid.NewGuid().ToString("N")
+                    string.IsNullOrEmpty(
+                        runId)
+                        ? Guid.NewGuid()
+                            .ToString("N")
                         : runId);
 
-                pendingFreshUpgradeRun = false;
+                pendingFreshUpgradeRun =
+                    false;
+
                 return;
             }
 
             if (pendingFreshUpgradeRun &&
-                !string.IsNullOrEmpty(runId) &&
-                !string.Equals(upgradeState.RunId, runId, StringComparison.Ordinal))
+                !string.IsNullOrEmpty(
+                    runId) &&
+                !string.Equals(
+                    upgradeState.RunId,
+                    runId,
+                    StringComparison.Ordinal))
             {
-                InitializeFreshState(runId);
+                InitializeFreshState(
+                    runId);
             }
 
-            pendingFreshUpgradeRun = false;
+            pendingFreshUpgradeRun =
+                false;
         }
 
         private void InitializeFreshState(string runId)
@@ -3774,8 +5725,8 @@ namespace CraftPeak
             ExitGames.Client.Photon.Hashtable props =
                 PhotonNetwork.CurrentRoom.CustomProperties;
 
-            object protocolValue;
-            object revisionValue;
+            object protocolValue = null;
+            object revisionValue = null;
 
             if (!props.TryGetValue(UpgradeProtocolKey, out protocolValue) ||
                 !props.TryGetValue(UpgradeRevisionKey, out revisionValue))
@@ -4055,8 +6006,25 @@ namespace CraftPeak
 
         private void ProcessUpgradeRequestOnHost(int actor, object[] payload)
         {
-            if (!PhotonNetwork.IsMasterClient || !upgradeStateLoaded)
+            if (!PhotonNetwork.IsMasterClient)
+            {
                 return;
+            }
+
+            if (!upgradeStateLoaded)
+            {
+                LoadUpgradeStateOnDemand();
+            }
+
+            if (!upgradeStateLoaded)
+            {
+                SendUpgradeResult(
+                    actor,
+                    false,
+                    "강화 상태를 초기화하지 못했습니다.");
+
+                return;
+            }
 
             if (!IsGameplayScene())
             {
@@ -4439,8 +6407,13 @@ namespace CraftPeak
 
         public void OnPlayerEnteredRoom(Photon.Realtime.Player newPlayer)
         {
-            if (PhotonNetwork.IsMasterClient && upgradeStateLoaded)
-                PublishUpgradeState(upgradeState, "Player entered room");
+            // P 메뉴가 닫혀 있을 때는 강화/부품 데이터를 읽거나 다시 발행하지 않습니다.
+            // 참가자 입장 사실만 dirty 상태로 남기고, 다음 P 입력에서 한 번 동기화합니다.
+            upgradeRoomStateDirty =
+                true;
+
+            partsRoomStateDirty =
+                true;
         }
 
         public void OnPlayerLeftRoom(Photon.Realtime.Player otherPlayer)
@@ -4453,17 +6426,63 @@ namespace CraftPeak
             if (changed == null)
                 return;
 
-            if (ContainsUpgradeProperty(changed))
+            bool upgradeChanged =
+                ContainsUpgradeProperty(
+                    changed);
+
+            bool partsChanged =
+                ContainsPartsProperty(
+                    changed);
+
+            if (upgradeChanged)
             {
-                ReadUpgradeStateFromRoom(true);
-                return;
+                upgradeRoomStateDirty =
+                    true;
+
+                if (activeWindow != null)
+                {
+                    LoadUpgradeStateOnDemand();
+                }
             }
 
-            if (changed.ContainsKey(RunIdKey))
-                nextUpgradePollAt = 0f;
+            if (partsChanged)
+            {
+                partsRoomStateDirty =
+                    true;
 
-            if (changed.ContainsKey(SharedMoneyKey))
+                if (activeWindow != null)
+                {
+                    LoadPartsStateOnDemand();
+                    RefreshWindow();
+                }
+            }
+
+            if (changed.ContainsKey(
+                    RunIdKey))
+            {
+                upgradeRoomStateDirty =
+                    true;
+
+                partsRoomStateDirty =
+                    true;
+
+                if (activeWindow != null)
+                {
+                    LoadUpgradeStateOnDemand();
+                    LoadPartsStateOnDemand();
+                    RefreshWindow();
+                }
+            }
+
+            if (changed.ContainsKey(
+                    SharedMoneyKey) &&
+                activeWindow != null)
+            {
+                cachedSharedMoney =
+                    ReadSharedMoney();
+
                 RefreshWindow();
+            }
         }
 
         public void OnPlayerPropertiesUpdate(
@@ -4478,14 +6497,42 @@ namespace CraftPeak
             if (newMasterClient == null)
                 return;
 
-            ReadUpgradeStateFromRoom(true);
+            upgradeRoomStateDirty =
+                true;
+
+            partsRoomStateDirty =
+                true;
 
             if (PhotonNetwork.LocalPlayer == null ||
-                newMasterClient.ActorNumber != PhotonNetwork.LocalPlayer.ActorNumber)
+                newMasterClient.ActorNumber !=
+                    PhotonNetwork.LocalPlayer.ActorNumber)
+            {
                 return;
+            }
 
-            if (upgradeStateLoaded)
-                PublishUpgradeState(upgradeState, "Host migration");
+            // 호스트 승계 시에도 닫힌 P 메뉴의 전체 데이터를 스캔하지 않습니다.
+            // 실제 상태는 Room Property에 남아 있고, P를 열 때 한 번 읽어 재확정합니다.
+            if (activeWindow != null)
+            {
+                LoadHubDataOnDemand();
+
+                if (upgradeStateLoaded)
+                {
+                    PublishUpgradeState(
+                        upgradeState,
+                        "Host migration");
+                }
+
+                if (partsStateLoaded)
+                {
+                    PublishPartsState(
+                        purchasedPartsMask,
+                        consumedPartsMask,
+                        peakUnlocked,
+                        partsRunId,
+                        "Host migration");
+                }
+            }
         }
 
         private static bool ContainsUpgradeProperty(
@@ -4503,6 +6550,24 @@ namespace CraftPeak
                    values.ContainsKey(UpgradeBaseHoldKey) ||
                    values.ContainsKey(UpgradeBaseStackKey) ||
                    values.ContainsKey(UpgradeBaseCampfireKey);
+        }
+
+        private static bool ContainsPartsProperty(
+            ExitGames.Client.Photon.Hashtable values)
+        {
+            return
+                values.ContainsKey(
+                    PartsProtocolKey) ||
+                values.ContainsKey(
+                    PartsRevisionKey) ||
+                values.ContainsKey(
+                    PartsRunIdKey) ||
+                values.ContainsKey(
+                    PartsPurchasedMaskKey) ||
+                values.ContainsKey(
+                    PartsConsumedMaskKey) ||
+                values.ContainsKey(
+                    PeakUnlockedKey);
         }
 
 
@@ -5225,6 +7290,50 @@ namespace CraftPeak
                 return;
             }
 
+            if (outputId ==
+                FlareItemId)
+            {
+                LoadPartsStateOnDemand();
+
+                if (GetCurrentSegmentIndex() !=
+                    (int)Segment.Peak)
+                {
+                    SendCraftResult(
+                        actorNumber,
+                        false,
+                        false,
+                        outputId,
+                        "최종 조명탄은 정상 구간에서만 제작할 수 있습니다.");
+
+                    return;
+                }
+
+                if (GetCurrentResourceLevel() <
+                    ResourceUpgradeMaximum)
+                {
+                    SendCraftResult(
+                        actorNumber,
+                        false,
+                        false,
+                        outputId,
+                        "최종 조명탄 제작에는 Legendary 제작 등급이 필요합니다.");
+
+                    return;
+                }
+
+                if (peakUnlocked)
+                {
+                    SendCraftResult(
+                        actorNumber,
+                        false,
+                        false,
+                        outputId,
+                        "최종 조명탄 제작과 탈출 신호 발사가 이미 완료되었습니다.");
+
+                    return;
+                }
+            }
+
             global::Player requester = PlayerHandler.GetPlayer(actorNumber);
             if (requester == null)
             {
@@ -5315,6 +7424,12 @@ namespace CraftPeak
                 true,
                 outputId,
                 recipe.DisplayName + " 제작에 성공했습니다!");
+
+            if (outputId ==
+                FlareItemId)
+            {
+                MarkFinalFlareCompletedAndNotify();
+            }
 
             Logger.LogInfo(
                 "Craft succeeded. Actor=" + actorNumber +
@@ -5793,6 +7908,12 @@ namespace CraftPeak
 
         private static void HandleConsumedSelectedSlots(object[] payload)
         {
+            if (Instance != null)
+            {
+                Instance.partyResourceCacheUntil =
+                    0f;
+            }
+
             if (payload == null ||
                 payload.Length < 1 ||
                 PhotonNetwork.LocalPlayer == null)
@@ -5860,7 +7981,7 @@ namespace CraftPeak
 
 
         // -----------------------------------------------------------------
-        // Unified UI construction
+        // Lite unified UI
         // -----------------------------------------------------------------
 
         private void BuildHubVisuals(
@@ -5895,8 +8016,8 @@ namespace CraftPeak
             Center(
                 panel.rectTransform,
                 new Vector2(
-                    1500f,
-                    880f),
+                    1280f,
+                    760f),
                 Vector2.zero);
 
             Image topLine =
@@ -5921,7 +8042,7 @@ namespace CraftPeak
                     0f,
                     -5f),
                 new Vector2(
-                    1500f,
+                    1280f,
                     10f));
 
             Image sidebar =
@@ -5943,11 +8064,11 @@ namespace CraftPeak
                     0f,
                     0.5f),
                 new Vector2(
-                    115f,
+                    100f,
                     0f),
                 new Vector2(
-                    230f,
-                    870f));
+                    200f,
+                    750f));
 
             TextMeshProUGUI logo =
                 CreateText(
@@ -5955,7 +8076,7 @@ namespace CraftPeak
                     sidebar.transform,
                     font,
                     "CRAFT\nPEAK",
-                    31f,
+                    29f,
                     TextAlignmentOptions.Center);
 
             logo.fontStyle =
@@ -5971,18 +8092,18 @@ namespace CraftPeak
                     1f),
                 new Vector2(
                     0f,
-                    -78f),
+                    -72f),
                 new Vector2(
-                    190f,
-                    100f));
+                    170f,
+                    92f));
 
             TextMeshProUGUI title =
                 CreateText(
                     "Title",
                     panel.transform,
                     font,
-                    "통합 관리",
-                    42f,
+                    "설명",
+                    38f,
                     TextAlignmentOptions.Center);
 
             Anchor(
@@ -5994,11 +8115,11 @@ namespace CraftPeak
                     0f,
                     1f),
                 new Vector2(
-                    805f,
-                    -53f),
+                    700f,
+                    -52f),
                 new Vector2(
-                    800f,
-                    65f));
+                    720f,
+                    58f));
 
             TextMeshProUGUI balance =
                 CreateText(
@@ -6006,7 +8127,7 @@ namespace CraftPeak
                     panel.transform,
                     font,
                     string.Empty,
-                    27f,
+                    24f,
                     TextAlignmentOptions.TopRight);
 
             Anchor(
@@ -6018,40 +8139,40 @@ namespace CraftPeak
                     1f,
                     1f),
                 new Vector2(
-                    -170f,
-                    -56f),
+                    -155f,
+                    -52f),
                 new Vector2(
-                    300f,
-                    46f));
+                    260f,
+                    42f));
 
-            List<TabButtonView> tabs =
-                new List<TabButtonView>();
+            List<LiteTabView> tabs =
+                new List<LiteTabView>();
 
             string[] tabNames =
             {
+                "설명",
                 "강화",
                 "제작",
-                "판매"
-            };
-
-            HubTab[] tabKinds =
-            {
-                HubTab.Upgrade,
-                HubTab.Craft,
-                HubTab.Sell
+                "판매",
+                "부품"
             };
 
             for (int i = 0;
                  i < tabNames.Length;
                  i++)
             {
-                HubTab captured =
-                    tabKinds[i];
+                HubTab tab =
+                    (HubTab)i;
 
-                Button button =
+                HubTab captured =
+                    tab;
+
+                TextMeshProUGUI tabLabel;
+
+                Button tabButton =
                     CreateButton(
                         "Tab_" +
-                        captured,
+                        tab,
                         sidebar.transform,
                         font,
                         tabNames[i],
@@ -6060,10 +8181,11 @@ namespace CraftPeak
                             0.19f,
                             0.22f,
                             1f),
-                        Color.white);
+                        Color.white,
+                        out tabLabel);
 
                 Anchor(
-                    button.GetComponent<
+                    tabButton.GetComponent<
                         RectTransform>(),
                     new Vector2(
                         0.5f,
@@ -6073,14 +8195,14 @@ namespace CraftPeak
                         1f),
                     new Vector2(
                         0f,
-                        -210f -
+                        -190f -
                         i *
-                        105f),
+                        92f),
                     new Vector2(
-                        190f,
-                        78f));
+                        168f,
+                        66f));
 
-                button.onClick.AddListener(
+                tabButton.onClick.AddListener(
                     new UnityAction(
                         delegate
                         {
@@ -6089,10 +8211,10 @@ namespace CraftPeak
                         }));
 
                 tabs.Add(
-                    new TabButtonView(
-                        captured,
-                        button,
-                        button.GetComponent<
+                    new LiteTabView(
+                        tab,
+                        tabButton,
+                        tabButton.GetComponent<
                             Image>()));
             }
 
@@ -6102,7 +8224,7 @@ namespace CraftPeak
                     sidebar.transform,
                     font,
                     "P / ESC\n닫기",
-                    18f,
+                    17f,
                     TextAlignmentOptions.Center);
 
             help.color =
@@ -6122,131 +8244,65 @@ namespace CraftPeak
                     0f),
                 new Vector2(
                     0f,
-                    65f),
+                    60f),
                 new Vector2(
-                    180f,
-                    70f));
+                    165f,
+                    65f));
 
-            GameObject contentContainer =
-                CreateRectObject(
-                    "ContentContainer",
-                    panel.transform);
-
-            Anchor(
-                contentContainer
-                    .GetComponent<RectTransform>(),
-                new Vector2(
-                    0f,
-                    0f),
-                new Vector2(
-                    0f,
-                    0f),
-                new Vector2(
-                    865f,
-                    385f),
-                new Vector2(
-                    1230f,
-                    735f));
-
-            UpgradeView upgradeView =
-                BuildUpgradeView(
-                    contentContainer.transform,
-                    font);
-
-            CraftView craftView =
-                BuildCraftView(
-                    contentContainer.transform,
-                    font);
-
-            SellView sellView =
-                BuildSellView(
-                    contentContainer.transform,
-                    font);
-
-            Button closeButton =
-                CreateButton(
-                    "CloseButton",
+            TextMeshProUGUI explanation =
+                CreateText(
+                    "Explanation",
                     panel.transform,
                     font,
-                    "닫기",
-                    new Color(
-                        0.26f,
-                        0.28f,
-                        0.32f,
-                        1f),
-                    Color.white);
+                    BuildExplanationText(),
+                    21f,
+                    TextAlignmentOptions.TopLeft);
 
             Anchor(
-                closeButton.GetComponent<
-                    RectTransform>(),
+                explanation.rectTransform,
                 new Vector2(
-                    1f,
-                    0f),
+                    0f,
+                    1f),
                 new Vector2(
-                    1f,
-                    0f),
+                    0f,
+                    1f),
                 new Vector2(
-                    -100f,
-                    34f),
+                    730f,
+                    -390f),
                 new Vector2(
-                    150f,
-                    52f));
+                    980f,
+                    565f));
 
-            closeButton.onClick.AddListener(
-                new UnityAction(
-                    CloseHub));
-
-            window.SetReferences(
-                tabs,
-                balance,
-                title,
-                upgradeView,
-                craftView,
-                sellView,
-                closeButton);
-        }
-
-        private UpgradeView BuildUpgradeView(
-            Transform parent,
-            TMP_FontAsset font)
-        {
-            GameObject root =
-                CreateRectObject(
-                    "UpgradeContent",
-                    parent);
-
-            Stretch(
-                root.GetComponent<
-                    RectTransform>());
-
-            List<UpgradeCardView>
-                cards =
-                    new List<
-                        UpgradeCardView>();
+            List<LiteRowView> rows =
+                new List<LiteRowView>();
 
             for (int i = 0;
-                 i < 5;
+                 i < MaximumVisibleInventorySlots;
                  i++)
             {
-                UpgradeKind kind =
-                    (UpgradeKind)i;
+                int capturedRow =
+                    i;
 
-                UpgradeKind captured =
-                    kind;
+                TextMeshProUGUI rowLabel;
 
-                Image background =
-                    CreateImage(
-                        "UpgradeCard_" +
-                        kind,
-                        root.transform,
+                Button rowButton =
+                    CreateButton(
+                        "Row_" +
+                        i,
+                        panel.transform,
+                        font,
+                        string.Empty,
                         new Color(
                             0.14f,
                             0.15f,
                             0.18f,
-                            1f));
+                            1f),
+                        Color.white,
+                        out rowLabel);
 
                 Anchor(
-                    background.rectTransform,
+                    rowButton.GetComponent<
+                        RectTransform>(),
                     new Vector2(
                         0f,
                         1f),
@@ -6254,96 +8310,40 @@ namespace CraftPeak
                         0f,
                         1f),
                     new Vector2(
-                        235f,
-                        -95f -
+                        515f,
+                        -125f -
                         i *
-                        113f),
+                        67f),
                     new Vector2(
-                        425f,
-                        92f));
+                        590f,
+                        54f));
 
-                Button button =
-                    background.gameObject
-                        .AddComponent<Button>();
+                rowLabel.alignment =
+                    TextAlignmentOptions.Left;
 
-                button.targetGraphic =
-                    background;
+                rowLabel.fontSize =
+                    19f;
 
-                TextMeshProUGUI cardTitle =
-                    CreateText(
-                        "Title",
-                        background.transform,
-                        font,
-                        GetUpgradeDisplayName(
-                            kind),
-                        23f,
-                        TextAlignmentOptions.TopLeft);
-
-                Anchor(
-                    cardTitle.rectTransform,
-                    new Vector2(
-                        0f,
-                        1f),
-                    new Vector2(
-                        0f,
-                        1f),
-                    new Vector2(
-                        215f,
-                        -25f),
-                    new Vector2(
-                        385f,
-                        35f));
-
-                TextMeshProUGUI stateText =
-                    CreateText(
-                        "State",
-                        background.transform,
-                        font,
-                        string.Empty,
-                        16f,
-                        TextAlignmentOptions.BottomLeft);
-
-                stateText.color =
-                    new Color(
-                        0.74f,
-                        0.77f,
-                        0.82f,
-                        1f);
-
-                Anchor(
-                    stateText.rectTransform,
-                    new Vector2(
-                        0f,
-                        0f),
-                    new Vector2(
-                        0f,
-                        0f),
-                    new Vector2(
-                        215f,
-                        20f),
-                    new Vector2(
-                        385f,
-                        35f));
-
-                button.onClick.AddListener(
+                rowButton.onClick.AddListener(
                     new UnityAction(
                         delegate
                         {
-                            SelectUpgradeKind(
-                                captured);
+                            SelectVisibleRow(
+                                capturedRow);
                         }));
 
-                cards.Add(
-                    new UpgradeCardView(
-                        kind,
-                        background,
-                        stateText));
+                rows.Add(
+                    new LiteRowView(
+                        rowButton,
+                        rowButton.GetComponent<
+                            Image>(),
+                        rowLabel));
             }
 
-            Image detail =
+            Image detailPanel =
                 CreateImage(
-                    "UpgradeDetail",
-                    root.transform,
+                    "DetailPanel",
+                    panel.transform,
                     new Color(
                         0.125f,
                         0.135f,
@@ -6351,32 +8351,32 @@ namespace CraftPeak
                         1f));
 
             Anchor(
+                detailPanel.rectTransform,
+                new Vector2(
+                    1f,
+                    0.5f),
+                new Vector2(
+                    1f,
+                    0.5f),
+                new Vector2(
+                    -235f,
+                    -5f),
+                new Vector2(
+                    430f,
+                    590f));
+
+            TextMeshProUGUI detail =
+                CreateText(
+                    "Detail",
+                    detailPanel.transform,
+                    font,
+                    string.Empty,
+                    21f,
+                    TextAlignmentOptions.TopLeft);
+
+            Anchor(
                 detail.rectTransform,
                 new Vector2(
-                    1f,
-                    0.5f),
-                new Vector2(
-                    1f,
-                    0.5f),
-                new Vector2(
-                    -335f,
-                    10f),
-                new Vector2(
-                    575f,
-                    640f));
-
-            TextMeshProUGUI detailTitle =
-                CreateText(
-                    "Title",
-                    detail.transform,
-                    font,
-                    string.Empty,
-                    34f,
-                    TextAlignmentOptions.Center);
-
-            Anchor(
-                detailTitle.rectTransform,
-                new Vector2(
                     0.5f,
                     1f),
                 new Vector2(
@@ -6384,152 +8384,18 @@ namespace CraftPeak
                     1f),
                 new Vector2(
                     0f,
-                    -65f),
+                    -185f),
                 new Vector2(
-                    520f,
-                    65f));
-
-            TextMeshProUGUI levelText =
-                CreateText(
-                    "Level",
-                    detail.transform,
-                    font,
-                    string.Empty,
-                    23f,
-                    TextAlignmentOptions.Center);
-
-            levelText.color =
-                new Color(
-                    0.82f,
-                    0.65f,
-                    0.26f,
-                    1f);
-
-            Anchor(
-                levelText.rectTransform,
-                new Vector2(
-                    0.5f,
-                    1f),
-                new Vector2(
-                    0.5f,
-                    1f),
-                new Vector2(
-                    0f,
-                    -120f),
-                new Vector2(
-                    500f,
-                    40f));
-
-            TextMeshProUGUI currentEffect =
-                CreateText(
-                    "Current",
-                    detail.transform,
-                    font,
-                    string.Empty,
-                    22f,
-                    TextAlignmentOptions.Center);
-
-            Anchor(
-                currentEffect.rectTransform,
-                new Vector2(
-                    0.5f,
-                    1f),
-                new Vector2(
-                    0.5f,
-                    1f),
-                new Vector2(
-                    0f,
-                    -205f),
-                new Vector2(
-                    500f,
-                    90f));
-
-            TextMeshProUGUI nextEffect =
-                CreateText(
-                    "Next",
-                    detail.transform,
-                    font,
-                    string.Empty,
-                    22f,
-                    TextAlignmentOptions.Center);
-
-            nextEffect.color =
-                new Color(
-                    0.76f,
-                    0.80f,
-                    0.88f,
-                    1f);
-
-            Anchor(
-                nextEffect.rectTransform,
-                new Vector2(
-                    0.5f,
-                    1f),
-                new Vector2(
-                    0.5f,
-                    1f),
-                new Vector2(
-                    0f,
-                    -310f),
-                new Vector2(
-                    500f,
-                    90f));
-
-            TextMeshProUGUI costChance =
-                CreateText(
-                    "CostChance",
-                    detail.transform,
-                    font,
-                    string.Empty,
-                    24f,
-                    TextAlignmentOptions.Center);
-
-            Anchor(
-                costChance.rectTransform,
-                new Vector2(
-                    0.5f,
-                    0.5f),
-                new Vector2(
-                    0.5f,
-                    0.5f),
-                new Vector2(
-                    0f,
-                    -38f),
-                new Vector2(
-                    500f,
-                    55f));
-
-            TextMeshProUGUI failure =
-                CreateText(
-                    "Failure",
-                    detail.transform,
-                    font,
-                    string.Empty,
-                    18f,
-                    TextAlignmentOptions.Center);
-
-            Anchor(
-                failure.rectTransform,
-                new Vector2(
-                    0.5f,
-                    0.5f),
-                new Vector2(
-                    0.5f,
-                    0.5f),
-                new Vector2(
-                    0f,
-                    -90f),
-                new Vector2(
-                    500f,
-                    40f));
+                    380f,
+                    315f));
 
             TextMeshProUGUI status =
                 CreateText(
                     "Status",
-                    detail.transform,
+                    detailPanel.transform,
                     font,
-                    upgradeStatus,
-                    19f,
+                    string.Empty,
+                    18f,
                     TextAlignmentOptions.Center);
 
             status.color =
@@ -6549,15 +8415,17 @@ namespace CraftPeak
                     0f),
                 new Vector2(
                     0f,
-                    135f),
+                    126f),
                 new Vector2(
-                    510f,
-                    80f));
+                    380f,
+                    86f));
+
+            TextMeshProUGUI actionLabel;
 
             Button action =
                 CreateButton(
-                    "UpgradeAction",
-                    detail.transform,
+                    "Action",
+                    detailPanel.transform,
                     font,
                     "강화 시도",
                     new Color(
@@ -6569,7 +8437,8 @@ namespace CraftPeak
                         0.07f,
                         0.07f,
                         0.08f,
-                        1f));
+                        1f),
+                    out actionLabel);
 
             Anchor(
                 action.GetComponent<
@@ -6582,241 +8451,22 @@ namespace CraftPeak
                     0f),
                 new Vector2(
                     0f,
-                    52f),
+                    48f),
                 new Vector2(
-                    410f,
-                    72f));
+                    350f,
+                    66f));
 
             action.onClick.AddListener(
                 new UnityAction(
-                    RequestUpgrade));
-
-            return
-                new UpgradeView(
-                    root,
-                    cards,
-                    detailTitle,
-                    levelText,
-                    currentEffect,
-                    nextEffect,
-                    costChance,
-                    failure,
-                    status,
-                    action);
-        }
-
-        private CraftView BuildCraftView(
-            Transform parent,
-            TMP_FontAsset font)
-        {
-            GameObject root =
-                CreateRectObject(
-                    "CraftContent",
-                    parent);
-
-            Stretch(
-                root.GetComponent<
-                    RectTransform>());
-
-            List<CraftCardView>
-                cards =
-                    new List<
-                        CraftCardView>();
-
-            const float cardWidth = 245f;
-            const float cardHeight = 135f;
-            const float gapX = 16f;
-            const float gapY = 16f;
-
-            float startX =
-                135f;
-
-            float startY =
-                -100f;
-
-            for (int cardIndex = 0;
-                 cardIndex <
-                     CraftRecipesPerPage;
-                 cardIndex++)
-            {
-                int captured =
-                    cardIndex;
-
-                int column =
-                    cardIndex %
-                    CraftRecipeColumns;
-
-                int row =
-                    cardIndex /
-                    CraftRecipeColumns;
-
-                Image background =
-                    CreateImage(
-                        "CraftCard_" +
-                        cardIndex,
-                        root.transform,
-                        new Color(
-                            0.14f,
-                            0.15f,
-                            0.18f,
-                            1f));
-
-                Anchor(
-                    background.rectTransform,
-                    new Vector2(
-                        0f,
-                        1f),
-                    new Vector2(
-                        0f,
-                        1f),
-                    new Vector2(
-                        startX +
-                        column *
-                        (
-                            cardWidth +
-                            gapX
-                        ),
-                        startY -
-                        row *
-                        (
-                            cardHeight +
-                            gapY
-                        )),
-                    new Vector2(
-                        cardWidth,
-                        cardHeight));
-
-                Button button =
-                    background.gameObject
-                        .AddComponent<Button>();
-
-                button.targetGraphic =
-                    background;
-
-                RawImage icon =
-                    CreateRawImage(
-                        "Icon",
-                        background.transform);
-
-                Anchor(
-                    icon.rectTransform,
-                    new Vector2(
-                        0f,
-                        0.5f),
-                    new Vector2(
-                        0f,
-                        0.5f),
-                    new Vector2(
-                        52f,
-                        9f),
-                    new Vector2(
-                        80f,
-                        80f));
-
-                TextMeshProUGUI name =
-                    CreateText(
-                        "Name",
-                        background.transform,
-                        font,
-                        string.Empty,
-                        18f,
-                        TextAlignmentOptions.TopLeft);
-
-                Anchor(
-                    name.rectTransform,
-                    new Vector2(
-                        0f,
-                        1f),
-                    new Vector2(
-                        0f,
-                        1f),
-                    new Vector2(
-                        164f,
-                        -31f),
-                    new Vector2(
-                        135f,
-                        50f));
-
-                TextMeshProUGUI category =
-                    CreateText(
-                        "Category",
-                        background.transform,
-                        font,
-                        string.Empty,
-                        14f,
-                        TextAlignmentOptions.Left);
-
-                category.color =
-                    new Color(
-                        0.70f,
-                        0.73f,
-                        0.78f,
-                        1f);
-
-                Anchor(
-                    category.rectTransform,
-                    new Vector2(
-                        0f,
-                        0.5f),
-                    new Vector2(
-                        0f,
-                        0.5f),
-                    new Vector2(
-                        164f,
-                        -2f),
-                    new Vector2(
-                        135f,
-                        28f));
-
-                TextMeshProUGUI cost =
-                    CreateText(
-                        "Cost",
-                        background.transform,
-                        font,
-                        string.Empty,
-                        14f,
-                        TextAlignmentOptions.BottomLeft);
-
-                Anchor(
-                    cost.rectTransform,
-                    new Vector2(
-                        0f,
-                        0f),
-                    new Vector2(
-                        0f,
-                        0f),
-                    new Vector2(
-                        164f,
-                        22f),
-                    new Vector2(
-                        135f,
-                        36f));
-
-                button.onClick.AddListener(
-                    new UnityAction(
-                        delegate
-                        {
-                            SelectCraftCard(
-                                captured);
-                        }));
-
-                cards.Add(
-                    new CraftCardView(
-                        background,
-                        button,
-                        icon,
-                        name,
-                        category,
-                        cost));
-            }
+                    ExecuteCurrentTabAction));
 
             TextMeshProUGUI page =
                 CreateText(
                     "Page",
-                    root.transform,
+                    panel.transform,
                     font,
                     string.Empty,
-                    19f,
+                    18f,
                     TextAlignmentOptions.Center);
 
             Anchor(
@@ -6828,16 +8478,18 @@ namespace CraftPeak
                     0f,
                     0f),
                 new Vector2(
-                    390f,
-                    35f),
+                    515f,
+                    40f),
                 new Vector2(
-                    300f,
+                    250f,
                     35f));
+
+            TextMeshProUGUI previousLabel;
 
             Button previous =
                 CreateButton(
                     "Previous",
-                    root.transform,
+                    panel.transform,
                     font,
                     "◀ 이전",
                     new Color(
@@ -6845,7 +8497,8 @@ namespace CraftPeak
                         0.24f,
                         0.28f,
                         1f),
-                    Color.white);
+                    Color.white,
+                    out previousLabel);
 
             Anchor(
                 previous.GetComponent<
@@ -6857,20 +8510,22 @@ namespace CraftPeak
                     0f,
                     0f),
                 new Vector2(
-                    120f,
-                    35f),
+                    315f,
+                    40f),
                 new Vector2(
-                    145f,
-                    54f));
+                    130f,
+                    50f));
 
             previous.onClick.AddListener(
                 new UnityAction(
                     PreviousCraftPage));
 
+            TextMeshProUGUI nextLabel;
+
             Button next =
                 CreateButton(
                     "Next",
-                    root.transform,
+                    panel.transform,
                     font,
                     "다음 ▶",
                     new Color(
@@ -6878,7 +8533,8 @@ namespace CraftPeak
                         0.24f,
                         0.28f,
                         1f),
-                    Color.white);
+                    Color.white,
+                    out nextLabel);
 
             Anchor(
                 next.GetComponent<
@@ -6890,685 +8546,497 @@ namespace CraftPeak
                     0f,
                     0f),
                 new Vector2(
-                    660f,
-                    35f),
+                    715f,
+                    40f),
                 new Vector2(
-                    145f,
-                    54f));
+                    130f,
+                    50f));
 
             next.onClick.AddListener(
                 new UnityAction(
                     NextCraftPage));
 
-            Image detail =
-                CreateImage(
-                    "CraftDetail",
-                    root.transform,
-                    new Color(
-                        0.125f,
-                        0.135f,
-                        0.16f,
-                        1f));
+            TextMeshProUGUI closeLabel;
 
-            Anchor(
-                detail.rectTransform,
-                new Vector2(
-                    1f,
-                    0.5f),
-                new Vector2(
-                    1f,
-                    0.5f),
-                new Vector2(
-                    -205f,
-                    10f),
-                new Vector2(
-                    390f,
-                    640f));
-
-            RawImage detailIcon =
-                CreateRawImage(
-                    "Icon",
-                    detail.transform);
-
-            Anchor(
-                detailIcon.rectTransform,
-                new Vector2(
-                    0.5f,
-                    1f),
-                new Vector2(
-                    0.5f,
-                    1f),
-                new Vector2(
-                    0f,
-                    -88f),
-                new Vector2(
-                    125f,
-                    125f));
-
-            TextMeshProUGUI detailName =
-                CreateText(
-                    "Name",
-                    detail.transform,
-                    font,
-                    string.Empty,
-                    28f,
-                    TextAlignmentOptions.Center);
-
-            Anchor(
-                detailName.rectTransform,
-                new Vector2(
-                    0.5f,
-                    1f),
-                new Vector2(
-                    0.5f,
-                    1f),
-                new Vector2(
-                    0f,
-                    -175f),
-                new Vector2(
-                    350f,
-                    60f));
-
-            TextMeshProUGUI detailCategory =
-                CreateText(
-                    "Category",
-                    detail.transform,
-                    font,
-                    string.Empty,
-                    18f,
-                    TextAlignmentOptions.Center);
-
-            detailCategory.color =
-                new Color(
-                    0.76f,
-                    0.78f,
-                    0.83f,
-                    1f);
-
-            Anchor(
-                detailCategory.rectTransform,
-                new Vector2(
-                    0.5f,
-                    1f),
-                new Vector2(
-                    0.5f,
-                    1f),
-                new Vector2(
-                    0f,
-                    -220f),
-                new Vector2(
-                    350f,
-                    35f));
-
-            TextMeshProUGUI requirements =
-                CreateText(
-                    "Requirements",
-                    detail.transform,
-                    font,
-                    string.Empty,
-                    20f,
-                    TextAlignmentOptions.TopLeft);
-
-            Anchor(
-                requirements.rectTransform,
-                new Vector2(
-                    0.5f,
-                    1f),
-                new Vector2(
-                    0.5f,
-                    1f),
-                new Vector2(
-                    0f,
-                    -345f),
-                new Vector2(
-                    345f,
-                    190f));
-
-            TextMeshProUGUI chance =
-                CreateText(
-                    "Chance",
-                    detail.transform,
-                    font,
-                    string.Empty,
-                    21f,
-                    TextAlignmentOptions.Center);
-
-            Anchor(
-                chance.rectTransform,
-                new Vector2(
-                    0.5f,
-                    0f),
-                new Vector2(
-                    0.5f,
-                    0f),
-                new Vector2(
-                    0f,
-                    175f),
-                new Vector2(
-                    350f,
-                    45f));
-
-            TextMeshProUGUI status =
-                CreateText(
-                    "Status",
-                    detail.transform,
-                    font,
-                    craftStatus,
-                    17f,
-                    TextAlignmentOptions.Center);
-
-            status.color =
-                new Color(
-                    0.76f,
-                    0.78f,
-                    0.83f,
-                    1f);
-
-            Anchor(
-                status.rectTransform,
-                new Vector2(
-                    0.5f,
-                    0f),
-                new Vector2(
-                    0.5f,
-                    0f),
-                new Vector2(
-                    0f,
-                    115f),
-                new Vector2(
-                    350f,
-                    70f));
-
-            Button action =
+            Button close =
                 CreateButton(
-                    "CraftAction",
-                    detail.transform,
+                    "Close",
+                    panel.transform,
                     font,
-                    "제작 시도",
+                    "닫기",
                     new Color(
-                        0.82f,
-                        0.65f,
                         0.26f,
+                        0.28f,
+                        0.32f,
                         1f),
-                    new Color(
-                        0.07f,
-                        0.07f,
-                        0.08f,
-                        1f));
+                    Color.white,
+                    out closeLabel);
 
             Anchor(
-                action.GetComponent<
+                close.GetComponent<
                     RectTransform>(),
                 new Vector2(
-                    0.5f,
+                    1f,
                     0f),
                 new Vector2(
-                    0.5f,
+                    1f,
                     0f),
                 new Vector2(
-                    0f,
-                    45f),
+                    -90f,
+                    30f),
                 new Vector2(
-                    320f,
-                    65f));
+                    130f,
+                    48f));
 
-            action.onClick.AddListener(
+            close.onClick.AddListener(
                 new UnityAction(
-                    RequestCraft));
+                    CloseHub));
 
-            return
-                new CraftView(
-                    root,
-                    cards,
-                    page,
-                    previous,
-                    next,
-                    detailIcon,
-                    detailName,
-                    detailCategory,
-                    requirements,
-                    chance,
-                    status,
-                    action);
+            window.SetReferences(
+                tabs,
+                rows,
+                title,
+                balance,
+                explanation,
+                detailPanel.gameObject,
+                detail,
+                status,
+                action,
+                actionLabel,
+                page,
+                previous,
+                next,
+                close);
         }
 
-        private SellView BuildSellView(
-            Transform parent,
-            TMP_FontAsset font)
+        private void SelectVisibleRow(
+            int rowIndex)
         {
-            GameObject root =
-                CreateRectObject(
-                    "SellContent",
-                    parent);
-
-            Stretch(
-                root.GetComponent<
-                    RectTransform>());
-
-            TextMeshProUGUI guide =
-                CreateText(
-                    "Guide",
-                    root.transform,
-                    font,
-                    "판매할 인벤토리 슬롯을 선택하세요.",
-                    22f,
-                    TextAlignmentOptions.Center);
-
-            Anchor(
-                guide.rectTransform,
-                new Vector2(
-                    0f,
-                    1f),
-                new Vector2(
-                    0f,
-                    1f),
-                new Vector2(
-                    390f,
-                    -40f),
-                new Vector2(
-                    700f,
-                    40f));
-
-            List<SellSlotView>
-                slots =
-                    new List<
-                        SellSlotView>();
-
-            const float width = 165f;
-            const float height = 175f;
-            const float gapX = 18f;
-            const float gapY = 20f;
-
-            for (int i = 0;
-                 i <
-                     MaximumVisibleInventorySlots;
-                 i++)
+            switch (currentTab)
             {
-                int captured =
-                    i;
+                case HubTab.Description:
+                    break;
 
-                int column =
-                    i %
-                    4;
+                case HubTab.Upgrade:
+                    if (rowIndex >=
+                            0 &&
+                        rowIndex <=
+                            (int)UpgradeKind.DoubleYield)
+                    {
+                        SelectUpgradeKind(
+                            (UpgradeKind)rowIndex);
+                    }
+                    break;
 
-                int row =
-                    i /
-                    4;
+                case HubTab.Craft:
+                    SelectCraftCard(
+                        rowIndex);
+                    break;
 
-                Image background =
-                    CreateImage(
-                        "InventorySlot_" +
-                        (i + 1),
-                        root.transform,
-                        new Color(
-                            0.14f,
-                            0.15f,
-                            0.18f,
-                            1f));
+                case HubTab.Sell:
+                    SelectSellSlot(
+                        rowIndex);
+                    break;
 
-                Anchor(
-                    background.rectTransform,
-                    new Vector2(
-                        0f,
-                        1f),
-                    new Vector2(
-                        0f,
-                        1f),
-                    new Vector2(
-                        105f +
-                        column *
-                        (
-                            width +
-                            gapX
-                        ),
-                        -155f -
-                        row *
-                        (
-                            height +
-                            gapY
-                        )),
-                    new Vector2(
-                        width,
-                        height));
+                case HubTab.Parts:
+                    SelectPart(
+                        rowIndex);
+                    break;
+            }
+        }
 
-                Button button =
-                    background.gameObject
-                        .AddComponent<Button>();
+        private void ExecuteCurrentTabAction()
+        {
+            switch (currentTab)
+            {
+                case HubTab.Description:
+                    break;
 
-                button.targetGraphic =
-                    background;
+                case HubTab.Upgrade:
+                    RequestUpgrade();
+                    break;
 
-                RawImage icon =
-                    CreateRawImage(
-                        "Icon",
-                        background.transform);
+                case HubTab.Craft:
+                    RequestCraft();
+                    break;
 
-                Anchor(
-                    icon.rectTransform,
-                    new Vector2(
-                        0.5f,
-                        0.5f),
-                    new Vector2(
-                        0.5f,
-                        0.5f),
-                    new Vector2(
-                        0f,
-                        12f),
-                    new Vector2(
-                        88f,
-                        88f));
+                case HubTab.Sell:
+                    RequestSell();
+                    break;
 
-                TextMeshProUGUI number =
-                    CreateText(
-                        "Number",
-                        background.transform,
-                        font,
-                        (i + 1).ToString(),
-                        20f,
-                        TextAlignmentOptions.TopLeft);
+                case HubTab.Parts:
+                    RequestPartPurchase();
+                    break;
+            }
+        }
 
-                StretchMargin(
-                    number.rectTransform,
-                    9f,
-                    9f,
-                    6f,
-                    6f);
+        private static string BuildExplanationText()
+        {
+            return
+                "Craft PEAK는 PEAK의 등산을 자원 수집과 제작 중심의 크래프팅 게임으로 바꾸는 모드입니다. " +
+                "게임 중 P키를 누르면 통합 상점이 열리며 설명, 강화, 제작, 판매, 부품 탭을 사용할 수 있습니다.\n\n" +
+                "맵에 흩어진 자원을 모아 판매하면 파티 공유 돈을 얻습니다. 공유 돈과 재료는 강화, 장비 제작, " +
+                "비행기 부품 구매에 함께 사용됩니다. 강화 탭에서 제작 등급을 Common에서 Normal, Rare, Unique, " +
+                "Legendary 순서로 올려야 다음 단계의 자원과 진행 조건이 열립니다.\n\n" +
+                "모닥불은 단순한 휴식 장소가 아니라 다음 세그먼트로 이동하기 위한 진행 트리거입니다. " +
+                "해안, 열대/뿌리숲, 메사/고산지대, 칼데라에서는 현재 구간에 맞는 제작 등급과 비행기 부품이 필요합니다. " +
+                "부품은 인벤토리에 들어가지 않고 Photon 방의 공동 진행 상태로 저장되며, 모닥불을 성공적으로 켤 때 사용 완료됩니다.\n\n" +
+                "진행 순서는 해안 → 열대/뿌리숲 → 메사/고산지대 → 칼데라 → 가마 → 정상입니다. " +
+                "가마에서 정상으로 갈 때는 모닥불과 비행기 부품을 사용하지 않습니다. 정상에 도착한 뒤 제작 탭에서 Legendary 재료가 들어가는 " +
+                "가장 비싼 최종 조명탄을 제작하면 최종 탈출 신호가 완성됩니다.\n\n" +
+                "핵심 흐름은 자원 수집 → 판매 → 강화와 제작 → 비행기 부품 구매 → 모닥불 점화 → 다음 구간 이동입니다.";
+        }
 
-                TextMeshProUGUI quantity =
-                    CreateText(
-                        "Quantity",
-                        background.transform,
-                        font,
-                        string.Empty,
-                        23f,
-                        TextAlignmentOptions.TopRight);
-
-                quantity.fontStyle =
-                    FontStyles.Bold;
-
-                StretchMargin(
-                    quantity.rectTransform,
-                    9f,
-                    9f,
-                    6f,
-                    6f);
-
-                TextMeshProUGUI name =
-                    CreateText(
-                        "Name",
-                        background.transform,
-                        font,
-                        "비어 있음",
-                        16f,
-                        TextAlignmentOptions.Bottom);
-
-                Anchor(
-                    name.rectTransform,
-                    new Vector2(
-                        0.5f,
-                        0f),
-                    new Vector2(
-                        0.5f,
-                        0f),
-                    new Vector2(
-                        0f,
-                        17f),
-                    new Vector2(
-                        width -
-                        16f,
-                        45f));
-
-                button.onClick.AddListener(
-                    new UnityAction(
-                        delegate
-                        {
-                            SelectSellSlot(
-                                captured);
-                        }));
-
-                slots.Add(
-                    new SellSlotView(
-                        i,
-                        background,
-                        button,
-                        icon,
-                        quantity,
-                        name));
+        private static string BuildCraftRowText(
+            CraftRecipe recipe)
+        {
+            if (recipe == null)
+            {
+                return
+                    string.Empty;
             }
 
-            Image detail =
-                CreateImage(
-                    "SellDetail",
-                    root.transform,
-                    new Color(
-                        0.125f,
-                        0.135f,
-                        0.16f,
-                        1f));
-
-            Anchor(
-                detail.rectTransform,
-                new Vector2(
-                    1f,
-                    0.5f),
-                new Vector2(
-                    1f,
-                    0.5f),
-                new Vector2(
-                    -205f,
-                    10f),
-                new Vector2(
-                    390f,
-                    640f));
-
-            RawImage detailIcon =
-                CreateRawImage(
-                    "Icon",
-                    detail.transform);
-
-            Anchor(
-                detailIcon.rectTransform,
-                new Vector2(
-                    0.5f,
-                    1f),
-                new Vector2(
-                    0.5f,
-                    1f),
-                new Vector2(
-                    0f,
-                    -105f),
-                new Vector2(
-                    145f,
-                    145f));
-
-            TextMeshProUGUI selectedText =
-                CreateText(
-                    "Selected",
-                    detail.transform,
-                    font,
-                    string.Empty,
-                    22f,
-                    TextAlignmentOptions.Center);
-
-            Anchor(
-                selectedText.rectTransform,
-                new Vector2(
-                    0.5f,
-                    1f),
-                new Vector2(
-                    0.5f,
-                    1f),
-                new Vector2(
-                    0f,
-                    -270f),
-                new Vector2(
-                    350f,
-                    160f));
-
-            TextMeshProUGUI priceGuide =
-                CreateText(
-                    "PriceGuide",
-                    detail.transform,
-                    font,
-                    "Common 1원\nNormal 3원\nRare 7원\nUnique 15원\nLegendary 50원",
-                    19f,
-                    TextAlignmentOptions.Center);
-
-            priceGuide.color =
-                new Color(
-                    0.72f,
-                    0.75f,
-                    0.80f,
-                    1f);
-
-            Anchor(
-                priceGuide.rectTransform,
-                new Vector2(
-                    0.5f,
-                    0.5f),
-                new Vector2(
-                    0.5f,
-                    0.5f),
-                new Vector2(
-                    0f,
-                    -20f),
-                new Vector2(
-                    330f,
-                    150f));
-
-            TextMeshProUGUI status =
-                CreateText(
-                    "Status",
-                    detail.transform,
-                    font,
-                    sellStatus,
-                    18f,
-                    TextAlignmentOptions.Center);
-
-            status.color =
-                new Color(
-                    0.76f,
-                    0.78f,
-                    0.83f,
-                    1f);
-
-            Anchor(
-                status.rectTransform,
-                new Vector2(
-                    0.5f,
-                    0f),
-                new Vector2(
-                    0.5f,
-                    0f),
-                new Vector2(
-                    0f,
-                    125f),
-                new Vector2(
-                    350f,
-                    80f));
-
-            Button action =
-                CreateButton(
-                    "SellAction",
-                    detail.transform,
-                    font,
-                    "1개 판매",
-                    new Color(
-                        0.82f,
-                        0.65f,
-                        0.26f,
-                        1f),
-                    new Color(
-                        0.07f,
-                        0.07f,
-                        0.08f,
-                        1f));
-
-            Anchor(
-                action.GetComponent<
-                    RectTransform>(),
-                new Vector2(
-                    0.5f,
-                    0f),
-                new Vector2(
-                    0.5f,
-                    0f),
-                new Vector2(
-                    0f,
-                    45f),
-                new Vector2(
-                    320f,
-                    65f));
-
-            action.onClick.AddListener(
-                new UnityAction(
-                    RequestSell));
-
             return
-                new SellView(
-                    root,
-                    slots,
-                    detailIcon,
-                    selectedText,
-                    status,
-                    action);
+                recipe.DisplayName +
+                "  |  " +
+                recipe.Category +
+                " / " +
+                GetTierName(
+                    recipe.Tier) +
+                "  |  " +
+                recipe.MoneyCost +
+                "원  |  " +
+                recipe.SuccessChance
+                    .ToString("0") +
+                "%";
         }
 
-        // -----------------------------------------------------------------
-        // Runtime UI helpers
-        // -----------------------------------------------------------------
-
-        private static GameObject CreateRectObject(
-            string name,
-            Transform parent)
+        private string BuildUpgradeRowText(
+            UpgradeKind kind)
         {
-            GameObject gameObject =
-                new GameObject(
-                    name,
-                    typeof(RectTransform));
+            return
+                GetUpgradeDisplayName(
+                    kind) +
+                "  |  " +
+                GetUpgradeCurrentLevel(
+                    kind) +
+                "/" +
+                GetUpgradeMaximumLevel(
+                    kind);
+        }
 
-            gameObject.transform.SetParent(
-                parent,
-                false);
+        private static string BuildSellRowText(
+            int slotId)
+        {
+            global::Player player =
+                global::Player.localPlayer;
 
-            return gameObject;
+            if (player == null ||
+                player.itemSlots == null ||
+                slotId < 0 ||
+                slotId >=
+                    player.itemSlots.Length)
+            {
+                return
+                    string.Empty;
+            }
+
+            ItemSlot slot =
+                player.GetItemSlot(
+                    (byte)slotId);
+
+            if (slot == null ||
+                slot.IsEmpty() ||
+                slot.prefab == null)
+            {
+                return
+                    (slotId + 1) +
+                    "번 슬롯  |  비어 있음";
+            }
+
+            int count =
+                Mathf.Max(
+                    1,
+                    InventoryStack.GetStackCount(
+                        player,
+                        (byte)slotId));
+
+            bool saleResource =
+                Spawn.IsSaleResourceId(
+                    slot.prefab.itemID);
+
+            return
+                (slotId + 1) +
+                "번 슬롯  |  " +
+                GetItemDisplayName(
+                    slot.prefab) +
+                (
+                    count >
+                        1
+                        ? " x" +
+                          count
+                        : string.Empty
+                ) +
+                (
+                    saleResource
+                        ? "  |  " +
+                          GetSellPrice(
+                              slot.prefab.itemID) +
+                          "원"
+                        : "  |  판매 불가"
+                );
+        }
+
+        private static string BuildUpgradeDetailText(
+            CraftHub owner)
+        {
+            UpgradeKind kind =
+                owner
+                    .SelectedUpgradeKind;
+
+            int current =
+                owner
+                    .SelectedUpgradeCurrentLevel;
+
+            int maximum =
+                owner
+                    .SelectedUpgradeMaximumLevel;
+
+            StringBuilder builder =
+                owner
+                    .sharedTextBuilder;
+
+            builder.Length =
+                0;
+
+            builder.Append(
+                owner.GetUpgradeDisplayName(
+                    kind));
+
+            builder.Append(
+                "\n\n");
+
+            builder.Append(
+                owner
+                    .SelectedUpgradeCurrentEffect);
+
+            builder.Append(
+                "\n\n");
+
+            builder.Append(
+                owner
+                    .SelectedUpgradeNextEffect);
+
+            builder.Append(
+                "\n\n");
+
+            if (current >=
+                maximum)
+            {
+                builder.Append(
+                    "최대 단계");
+            }
+            else
+            {
+                builder.Append(
+                    "비용 ");
+
+                builder.Append(
+                    owner
+                        .SelectedUpgradeCost);
+
+                builder.Append(
+                    "원\n성공 확률 ");
+
+                builder.Append(
+                    owner
+                        .SelectedUpgradeChance
+                        .ToString("0.#"));
+
+                builder.Append(
+                    "%");
+            }
+
+            builder.Append(
+                "\n\n");
+
+            if (!owner
+                    .UpgradeFailureActive)
+            {
+                builder.Append(
+                    "강화 실패 비활성화");
+            }
+            else
+            {
+                builder.Append(
+                    owner
+                        .UpgradeFailureConsumesCost
+                        ? "실패 시 단계 유지 · 비용 소모"
+                        : "실패 시 단계 유지 · 비용 보존");
+            }
+
+            return
+                builder.ToString();
+        }
+
+        private static string BuildCraftDetailText(
+            CraftHub owner,
+            CraftRecipe recipe,
+            out bool ready)
+        {
+            ready =
+                false;
+
+            if (recipe == null)
+            {
+                return
+                    "제작할 아이템을 선택하세요.";
+            }
+
+            string requirements =
+                owner
+                    .BuildCraftRequirementText(
+                        recipe,
+                        out ready);
+
+            StringBuilder builder =
+                owner
+                    .sharedTextBuilder;
+
+            builder.Length =
+                0;
+
+            builder.Append(
+                recipe.DisplayName);
+
+            builder.Append(
+                "\n");
+
+            builder.Append(
+                recipe.Category);
+
+            builder.Append(
+                " / ");
+
+            builder.Append(
+                GetTierName(
+                    recipe.Tier));
+
+            builder.Append(
+                "\n\n");
+
+            builder.Append(
+                requirements);
+
+            builder.Append(
+                "\n\n성공 확률 ");
+
+            builder.Append(
+                recipe.SuccessChance
+                    .ToString("0"));
+
+            builder.Append(
+                "%");
+
+            return
+                builder.ToString();
+        }
+
+        private static void SetActiveIfChanged(
+            GameObject gameObject,
+            bool active)
+        {
+            if (gameObject != null &&
+                gameObject.activeSelf !=
+                    active)
+            {
+                gameObject.SetActive(
+                    active);
+            }
+        }
+
+        private static void SetTextIfChanged(
+            TextMeshProUGUI label,
+            string text)
+        {
+            if (label == null)
+            {
+                return;
+            }
+
+            string safe =
+                text ??
+                string.Empty;
+
+            if (!string.Equals(
+                    label.text,
+                    safe,
+                    StringComparison.Ordinal))
+            {
+                label.text =
+                    safe;
+            }
+        }
+
+        private static void SetInteractableIfChanged(
+            Button button,
+            bool interactable)
+        {
+            if (button != null &&
+                button.interactable !=
+                    interactable)
+            {
+                button.interactable =
+                    interactable;
+            }
         }
 
         private static TMP_FontAsset ResolveFont()
         {
-            TextMeshProUGUI[] texts =
-                Resources
-                    .FindObjectsOfTypeAll<
-                        TextMeshProUGUI>();
-
-            for (int i = 0;
-                 i < texts.Length;
-                 i++)
+            if (cachedFontAsset !=
+                null)
             {
-                if (texts[i] != null &&
-                    texts[i].font != null &&
-                    texts[i].gameObject
-                        .scene
-                        .IsValid())
+                return
+                    cachedFontAsset;
+            }
+
+            GUIManager gui =
+                GUIManager.instance;
+
+            if (gui != null)
+            {
+                TextMeshProUGUI sample =
+                    gui.GetComponentInChildren<
+                        TextMeshProUGUI>(
+                        true);
+
+                if (sample != null &&
+                    sample.font != null)
                 {
+                    cachedFontAsset =
+                        sample.font;
+
                     return
-                        texts[i].font;
+                        cachedFontAsset;
                 }
             }
 
-            return
+            cachedFontAsset =
                 TMP_Settings
                     .defaultFontAsset;
+
+            return
+                cachedFontAsset;
         }
 
         private static Image CreateImage(
-            string name,
+            string objectName,
             Transform parent,
             Color color)
         {
             GameObject gameObject =
                 new GameObject(
-                    name,
+                    objectName,
                     typeof(RectTransform),
                     typeof(CanvasRenderer),
                     typeof(Image));
@@ -7578,46 +9046,26 @@ namespace CraftPeak
                 false);
 
             Image image =
-                gameObject
-                    .GetComponent<Image>();
+                gameObject.GetComponent<Image>();
 
             image.color =
                 color;
 
-            return image;
-        }
-
-        private static RawImage CreateRawImage(
-            string name,
-            Transform parent)
-        {
-            GameObject gameObject =
-                new GameObject(
-                    name,
-                    typeof(RectTransform),
-                    typeof(CanvasRenderer),
-                    typeof(RawImage));
-
-            gameObject.transform.SetParent(
-                parent,
-                false);
-
             return
-                gameObject
-                    .GetComponent<RawImage>();
+                image;
         }
 
         private static TextMeshProUGUI CreateText(
-            string name,
+            string objectName,
             Transform parent,
             TMP_FontAsset font,
             string text,
-            float size,
+            float fontSize,
             TextAlignmentOptions alignment)
         {
             GameObject gameObject =
                 new GameObject(
-                    name,
+                    objectName,
                     typeof(RectTransform),
                     typeof(CanvasRenderer),
                     typeof(TextMeshProUGUI));
@@ -7637,7 +9085,7 @@ namespace CraftPeak
                 text;
 
             label.fontSize =
-                size;
+                fontSize;
 
             label.alignment =
                 alignment;
@@ -7651,22 +9099,24 @@ namespace CraftPeak
             label.raycastTarget =
                 false;
 
-            return label;
+            return
+                label;
         }
 
         private static Button CreateButton(
-            string name,
+            string objectName,
             Transform parent,
             TMP_FontAsset font,
-            string text,
-            Color background,
-            Color foreground)
+            string labelText,
+            Color backgroundColor,
+            Color textColor,
+            out TextMeshProUGUI label)
         {
             Image image =
                 CreateImage(
-                    name,
+                    objectName,
                     parent,
-                    background);
+                    backgroundColor);
 
             Button button =
                 image.gameObject
@@ -7683,9 +9133,9 @@ namespace CraftPeak
 
             colors.highlightedColor =
                 new Color(
-                    1.08f,
-                    1.08f,
-                    1.08f,
+                    1.06f,
+                    1.06f,
+                    1.06f,
                     1f);
 
             colors.pressedColor =
@@ -7705,125 +9155,122 @@ namespace CraftPeak
             button.colors =
                 colors;
 
-            TextMeshProUGUI label =
+            label =
                 CreateText(
                     "Label",
                     image.transform,
                     font,
-                    text,
-                    24f,
+                    labelText,
+                    22f,
                     TextAlignmentOptions.Center);
 
             label.color =
-                foreground;
+                textColor;
 
             StretchMargin(
                 label.rectTransform,
-                8f,
-                8f,
-                4f,
-                4f);
+                12f,
+                12f,
+                5f,
+                5f);
 
-            return button;
+            return
+                button;
         }
 
         private static void Stretch(
-            RectTransform rect)
+            RectTransform rectTransform)
         {
-            rect.anchorMin =
+            rectTransform.anchorMin =
                 Vector2.zero;
 
-            rect.anchorMax =
+            rectTransform.anchorMax =
                 Vector2.one;
 
-            rect.offsetMin =
+            rectTransform.offsetMin =
                 Vector2.zero;
 
-            rect.offsetMax =
+            rectTransform.offsetMax =
                 Vector2.zero;
         }
 
         private static void StretchMargin(
-            RectTransform rect,
+            RectTransform rectTransform,
             float left,
             float right,
             float top,
             float bottom)
         {
-            rect.anchorMin =
+            rectTransform.anchorMin =
                 Vector2.zero;
 
-            rect.anchorMax =
+            rectTransform.anchorMax =
                 Vector2.one;
 
-            rect.offsetMin =
+            rectTransform.offsetMin =
                 new Vector2(
                     left,
                     bottom);
 
-            rect.offsetMax =
+            rectTransform.offsetMax =
                 new Vector2(
                     -right,
                     -top);
         }
 
         private static void Center(
-            RectTransform rect,
+            RectTransform rectTransform,
             Vector2 size,
             Vector2 position)
         {
-            rect.anchorMin =
+            rectTransform.anchorMin =
                 new Vector2(
                     0.5f,
                     0.5f);
 
-            rect.anchorMax =
+            rectTransform.anchorMax =
                 new Vector2(
                     0.5f,
                     0.5f);
 
-            rect.pivot =
+            rectTransform.pivot =
                 new Vector2(
                     0.5f,
                     0.5f);
 
-            rect.sizeDelta =
+            rectTransform.sizeDelta =
                 size;
 
-            rect.anchoredPosition =
+            rectTransform.anchoredPosition =
                 position;
         }
 
         private static void Anchor(
-            RectTransform rect,
-            Vector2 min,
-            Vector2 max,
+            RectTransform rectTransform,
+            Vector2 anchorMin,
+            Vector2 anchorMax,
             Vector2 position,
             Vector2 size)
         {
-            rect.anchorMin =
-                min;
+            rectTransform.anchorMin =
+                anchorMin;
 
-            rect.anchorMax =
-                max;
+            rectTransform.anchorMax =
+                anchorMax;
 
-            rect.pivot =
+            rectTransform.pivot =
                 new Vector2(
                     0.5f,
                     0.5f);
 
-            rect.sizeDelta =
+            rectTransform.sizeDelta =
                 size;
 
-            rect.anchoredPosition =
+            rectTransform.anchoredPosition =
                 position;
         }
 
-        // -----------------------------------------------------------------
-        // View models
-        // -----------------------------------------------------------------
-
-        private sealed class TabButtonView
+        private sealed class LiteTabView
         {
             private static readonly Color Normal =
                 new Color(
@@ -7843,7 +9290,7 @@ namespace CraftPeak
             private readonly Button button;
             private readonly Image image;
 
-            public TabButtonView(
+            public LiteTabView(
                 HubTab value,
                 Button tabButton,
                 Image tabImage)
@@ -7863,23 +9310,28 @@ namespace CraftPeak
             {
                 if (image != null)
                 {
-                    image.color =
+                    Color target =
                         tab ==
                             selectedTab
                             ? Selected
                             : Normal;
+
+                    if (image.color !=
+                        target)
+                    {
+                        image.color =
+                            target;
+                    }
                 }
 
-                if (button != null)
-                {
-                    button.interactable =
-                        tab !=
-                        selectedTab;
-                }
+                SetInteractableIfChanged(
+                    button,
+                    tab !=
+                        selectedTab);
             }
         }
 
-        private sealed class UpgradeCardView
+        private sealed class LiteRowView
         {
             private static readonly Color Normal =
                 new Color(
@@ -7895,954 +9347,88 @@ namespace CraftPeak
                     0.26f,
                     1f);
 
-            private readonly UpgradeKind kind;
-            private readonly Image background;
-            private readonly TextMeshProUGUI stateText;
-
-            public UpgradeCardView(
-                UpgradeKind value,
-                Image image,
-                TextMeshProUGUI text)
-            {
-                kind =
-                    value;
-
-                background =
-                    image;
-
-                stateText =
-                    text;
-            }
-
-            public void Refresh(
-                CraftHub owner,
-                bool selected)
-            {
-                if (background != null)
-                {
-                    background.color =
-                        selected
-                            ? Selected
-                            : Normal;
-                }
-
-                int current =
-                    owner.GetUpgradeCurrentLevel(
-                        kind);
-
-                int maximum =
-                    GetUpgradeMaximumLevel(
-                        kind);
-
-                string effect =
-                    owner.GetUpgradeCurrentEffect(
-                        kind);
-
-                if (stateText != null)
-                {
-                    stateText.text =
-                        current >=
-                            maximum
-                            ? "최대 단계 · " +
-                              effect
-                            : "단계 " +
-                              current +
-                              "/" +
-                              maximum +
-                              " · " +
-                              effect;
-                }
-            }
-        }
-
-        private sealed class UpgradeView
-        {
-            public readonly GameObject Root;
-
-            private readonly List<UpgradeCardView>
-                cards;
-
-            private readonly TextMeshProUGUI title;
-            private readonly TextMeshProUGUI level;
-            private readonly TextMeshProUGUI current;
-            private readonly TextMeshProUGUI next;
-            private readonly TextMeshProUGUI costChance;
-            private readonly TextMeshProUGUI failure;
-            private readonly TextMeshProUGUI status;
-
-            private readonly Button action;
-
-            public UpgradeView(
-                GameObject root,
-                List<UpgradeCardView> cardViews,
-                TextMeshProUGUI detailTitle,
-                TextMeshProUGUI levelText,
-                TextMeshProUGUI currentEffect,
-                TextMeshProUGUI nextEffect,
-                TextMeshProUGUI costChanceText,
-                TextMeshProUGUI failureText,
-                TextMeshProUGUI statusText,
-                Button actionButton)
-            {
-                Root =
-                    root;
-
-                cards =
-                    cardViews;
-
-                title =
-                    detailTitle;
-
-                level =
-                    levelText;
-
-                current =
-                    currentEffect;
-
-                next =
-                    nextEffect;
-
-                costChance =
-                    costChanceText;
-
-                failure =
-                    failureText;
-
-                status =
-                    statusText;
-
-                action =
-                    actionButton;
-            }
-
-            public void Refresh(
-                CraftHub owner)
-            {
-                if (owner == null)
-                {
-                    return;
-                }
-
-                UpgradeKind selected =
-                    owner.SelectedUpgradeKind;
-
-                for (int i = 0;
-                     i < cards.Count;
-                     i++)
-                {
-                    cards[i].Refresh(
-                        owner,
-                        (int)selected ==
-                            i);
-                }
-
-                int currentLevel =
-                    owner
-                        .SelectedUpgradeCurrentLevel;
-
-                int maximumLevel =
-                    owner
-                        .SelectedUpgradeMaximumLevel;
-
-                bool maximumReached =
-                    currentLevel >=
-                        maximumLevel;
-
-                if (title != null)
-                {
-                    title.text =
-                        owner.GetUpgradeDisplayName(
-                            selected);
-                }
-
-                if (level != null)
-                {
-                    level.text =
-                        "강화 단계 " +
-                        currentLevel +
-                        " / " +
-                        maximumLevel;
-                }
-
-                if (current != null)
-                {
-                    current.text =
-                        owner
-                            .SelectedUpgradeCurrentEffect;
-                }
-
-                if (next != null)
-                {
-                    next.text =
-                        owner
-                            .SelectedUpgradeNextEffect;
-                }
-
-                if (costChance != null)
-                {
-                    costChance.text =
-                        maximumReached
-                            ? "최대 단계"
-                            : "비용 " +
-                              owner
-                                  .SelectedUpgradeCost +
-                              "원 · 성공 확률 " +
-                              owner
-                                  .SelectedUpgradeChance
-                                  .ToString("0.#") +
-                              "%";
-                }
-
-                if (failure != null)
-                {
-                    if (!owner
-                            .UpgradeFailureActive)
-                    {
-                        failure.text =
-                            "강화 실패 비활성화 · 모든 강화 100% 성공";
-
-                        failure.color =
-                            new Color(
-                                0.48f,
-                                0.88f,
-                                0.54f,
-                                1f);
-                    }
-                    else
-                    {
-                        failure.text =
-                            owner
-                                .UpgradeFailureConsumesCost
-                                ? "실패 시 단계 유지 · 비용 소모"
-                                : "실패 시 단계 유지 · 비용 보존";
-
-                        failure.color =
-                            new Color(
-                                0.95f,
-                                0.58f,
-                                0.58f,
-                                1f);
-                    }
-                }
-
-                if (status != null)
-                {
-                    status.text =
-                        owner.upgradeStatus;
-                }
-
-                if (action != null)
-                {
-                    action.interactable =
-                        owner
-                            .CanAttemptUpgrade;
-
-                    TextMeshProUGUI label =
-                        action
-                            .GetComponentInChildren<
-                                TextMeshProUGUI>();
-
-                    if (label != null)
-                    {
-                        label.text =
-                            maximumReached
-                                ? "최대 단계"
-                                : (
-                                    owner.pendingRequest ==
-                                        PendingRequest.Upgrade
-                                        ? "처리 중..."
-                                        : "강화 시도"
-                                );
-                    }
-                }
-            }
-        }
-
-        private sealed class CraftCardView
-        {
-            private static readonly Color Normal =
-                new Color(
-                    0.14f,
-                    0.15f,
-                    0.18f,
-                    1f);
-
-            private static readonly Color Selected =
-                new Color(
-                    0.82f,
-                    0.65f,
-                    0.26f,
-                    1f);
-
-            private readonly Image background;
             private readonly Button button;
-            private readonly RawImage icon;
-            private readonly TextMeshProUGUI name;
-            private readonly TextMeshProUGUI category;
-            private readonly TextMeshProUGUI cost;
+            private readonly Image image;
+            private readonly TextMeshProUGUI label;
 
-            public CraftCardView(
-                Image image,
-                Button cardButton,
-                RawImage cardIcon,
-                TextMeshProUGUI cardName,
-                TextMeshProUGUI cardCategory,
-                TextMeshProUGUI cardCost)
+            public LiteRowView(
+                Button rowButton,
+                Image rowImage,
+                TextMeshProUGUI rowLabel)
             {
-                background =
-                    image;
-
                 button =
-                    cardButton;
+                    rowButton;
 
-                icon =
-                    cardIcon;
+                image =
+                    rowImage;
 
-                name =
-                    cardName;
-
-                category =
-                    cardCategory;
-
-                cost =
-                    cardCost;
+                label =
+                    rowLabel;
             }
 
             public void Refresh(
-                CraftRecipe recipe,
-                bool selected)
+                bool active,
+                bool selected,
+                string text)
             {
-                bool hasRecipe =
-                    recipe !=
-                    null;
+                SetActiveIfChanged(
+                    button.gameObject,
+                    active);
 
-                if (button != null)
-                {
-                    button.gameObject
-                        .SetActive(
-                            hasRecipe);
-
-                    button.interactable =
-                        hasRecipe;
-                }
-
-                if (!hasRecipe)
+                if (!active)
                 {
                     return;
                 }
 
-                if (background != null)
+                if (image != null)
                 {
-                    background.color =
+                    Color target =
                         selected
                             ? Selected
                             : Normal;
-                }
 
-                if (icon != null)
-                {
-                    icon.texture =
-                        recipe.OutputPrefab !=
-                            null &&
-                        recipe.OutputPrefab
-                                .UIData !=
-                            null
-                            ? recipe
-                                .OutputPrefab
-                                .UIData
-                                .GetIcon()
-                            : null;
-
-                    icon.enabled =
-                        icon.texture !=
-                        null;
-                }
-
-                if (name != null)
-                {
-                    name.text =
-                        recipe.DisplayName;
-                }
-
-                if (category != null)
-                {
-                    category.text =
-                        recipe.Category +
-                        " · " +
-                        GetTierName(
-                            recipe.Tier);
-                }
-
-                if (cost != null)
-                {
-                    cost.text =
-                        recipe.MoneyCost +
-                        "원 · " +
-                        recipe.SuccessChance
-                            .ToString("0") +
-                        "%";
-                }
-            }
-        }
-
-        private sealed class CraftView
-        {
-            public readonly GameObject Root;
-
-            private readonly List<CraftCardView>
-                cards;
-
-            private readonly TextMeshProUGUI page;
-            private readonly Button previous;
-            private readonly Button next;
-
-            private readonly RawImage detailIcon;
-            private readonly TextMeshProUGUI detailName;
-            private readonly TextMeshProUGUI detailCategory;
-            private readonly TextMeshProUGUI requirements;
-            private readonly TextMeshProUGUI chance;
-            private readonly TextMeshProUGUI status;
-
-            private readonly Button action;
-
-            public CraftView(
-                GameObject root,
-                List<CraftCardView> cardViews,
-                TextMeshProUGUI pageText,
-                Button previousButton,
-                Button nextButton,
-                RawImage selectedIcon,
-                TextMeshProUGUI selectedName,
-                TextMeshProUGUI selectedCategory,
-                TextMeshProUGUI requirementText,
-                TextMeshProUGUI chanceText,
-                TextMeshProUGUI statusText,
-                Button actionButton)
-            {
-                Root =
-                    root;
-
-                cards =
-                    cardViews;
-
-                page =
-                    pageText;
-
-                previous =
-                    previousButton;
-
-                next =
-                    nextButton;
-
-                detailIcon =
-                    selectedIcon;
-
-                detailName =
-                    selectedName;
-
-                detailCategory =
-                    selectedCategory;
-
-                requirements =
-                    requirementText;
-
-                chance =
-                    chanceText;
-
-                status =
-                    statusText;
-
-                action =
-                    actionButton;
-            }
-
-            public void Refresh(
-                CraftHub owner)
-            {
-                CraftRecipe selected =
-                    owner
-                        .SelectedCraftRecipe;
-
-                for (int i = 0;
-                     i < cards.Count;
-                     i++)
-                {
-                    CraftRecipe recipe =
-                        owner
-                            .GetCraftRecipeAtCard(
-                                i);
-
-                    cards[i].Refresh(
-                        recipe,
-                        recipe != null &&
-                        selected != null &&
-                        recipe.OutputItemId ==
-                            selected.OutputItemId);
-                }
-
-                if (page != null)
-                {
-                    page.text =
-                        "제작 목록 " +
-                        (
-                            owner.CraftPage +
-                            1
-                        ) +
-                        " / " +
-                        owner
-                            .CraftTotalPages;
-                }
-
-                if (previous != null)
-                {
-                    previous.interactable =
-                        owner.CraftPage >
-                        0;
-                }
-
-                if (next != null)
-                {
-                    next.interactable =
-                        owner.CraftPage <
-                        owner.CraftTotalPages -
-                        1;
-                }
-
-                bool ready =
-                    false;
-
-                string requirementText =
-                    owner
-                        .BuildCraftRequirementText(
-                            selected,
-                            out ready);
-
-                if (selected == null)
-                {
-                    if (detailIcon != null)
+                    if (image.color !=
+                        target)
                     {
-                        detailIcon.enabled =
-                            false;
-                    }
-
-                    if (detailName != null)
-                    {
-                        detailName.text =
-                            "제작식 미선택";
-                    }
-
-                    if (detailCategory != null)
-                    {
-                        detailCategory.text =
-                            string.Empty;
-                    }
-
-                    if (chance != null)
-                    {
-                        chance.text =
-                            string.Empty;
-                    }
-                }
-                else
-                {
-                    if (detailIcon != null)
-                    {
-                        detailIcon.texture =
-                            selected.OutputPrefab !=
-                                null &&
-                            selected.OutputPrefab
-                                .UIData !=
-                                null
-                                ? selected
-                                    .OutputPrefab
-                                    .UIData
-                                    .GetIcon()
-                                : null;
-
-                        detailIcon.enabled =
-                            detailIcon.texture !=
-                            null;
-                    }
-
-                    if (detailName != null)
-                    {
-                        detailName.text =
-                            selected.DisplayName;
-                    }
-
-                    if (detailCategory != null)
-                    {
-                        detailCategory.text =
-                            selected.Category +
-                            " · " +
-                            GetTierName(
-                                selected.Tier);
-                    }
-
-                    if (chance != null)
-                    {
-                        chance.text =
-                            "제작 성공 확률: " +
-                            selected
-                                .SuccessChance
-                                .ToString("0") +
-                            "%";
+                        image.color =
+                            target;
                     }
                 }
 
-                if (requirements != null)
-                {
-                    requirements.text =
-                        requirementText;
-                }
+                SetTextIfChanged(
+                    label,
+                    text);
 
-                if (status != null)
-                {
-                    status.text =
-                        owner.craftStatus;
-                }
-
-                if (action != null)
-                {
-                    action.interactable =
-                        selected !=
-                            null &&
-                        ready &&
-                        owner.pendingRequest ==
-                            PendingRequest.None;
-
-                    TextMeshProUGUI label =
-                        action
-                            .GetComponentInChildren<
-                                TextMeshProUGUI>();
-
-                    if (label != null)
-                    {
-                        label.text =
-                            owner.pendingRequest ==
-                                PendingRequest.Craft
-                                ? "처리 중..."
-                                : "제작 시도";
-                    }
-                }
-            }
-        }
-
-        private sealed class SellSlotView
-        {
-            private static readonly Color Normal =
-                new Color(
-                    0.14f,
-                    0.15f,
-                    0.18f,
-                    1f);
-
-            private static readonly Color Selected =
-                new Color(
-                    0.82f,
-                    0.65f,
-                    0.26f,
-                    1f);
-
-            private readonly int slotId;
-            private readonly Image background;
-            private readonly Button button;
-            private readonly RawImage icon;
-            private readonly TextMeshProUGUI quantity;
-            private readonly TextMeshProUGUI name;
-
-            public SellSlotView(
-                int id,
-                Image image,
-                Button slotButton,
-                RawImage slotIcon,
-                TextMeshProUGUI quantityText,
-                TextMeshProUGUI nameText)
-            {
-                slotId =
-                    id;
-
-                background =
-                    image;
-
-                button =
-                    slotButton;
-
-                icon =
-                    slotIcon;
-
-                quantity =
-                    quantityText;
-
-                name =
-                    nameText;
-            }
-
-            public void Refresh(
-                CraftHub owner)
-            {
-                global::Player player =
-                    global::Player
-                        .localPlayer;
-
-                bool visible =
-                    player != null &&
-                    player.itemSlots !=
-                        null &&
-                    slotId <
-                        player.itemSlots.Length;
-
-                if (button != null)
-                {
-                    button.gameObject
-                        .SetActive(
-                            visible);
-                }
-
-                if (!visible)
-                {
-                    return;
-                }
-
-                ItemSlot slot =
-                    player.GetItemSlot(
-                        (byte)slotId);
-
-                bool selected =
-                    owner
-                        .SelectedSellSlotId ==
-                    slotId;
-
-                if (background != null)
-                {
-                    background.color =
-                        selected
-                            ? Selected
-                            : Normal;
-                }
-
-                if (slot == null ||
-                    slot.IsEmpty() ||
-                    slot.prefab == null)
-                {
-                    if (icon != null)
-                    {
-                        icon.enabled =
-                            false;
-                    }
-
-                    if (quantity != null)
-                    {
-                        quantity.text =
-                            string.Empty;
-                    }
-
-                    if (name != null)
-                    {
-                        name.text =
-                            "비어 있음";
-                    }
-
-                    return;
-                }
-
-                if (icon != null)
-                {
-                    icon.texture =
-                        slot.prefab.UIData !=
-                            null
-                            ? slot.prefab
-                                .UIData
-                                .GetIcon()
-                            : null;
-
-                    icon.enabled =
-                        icon.texture !=
-                        null;
-                }
-
-                int stackCount =
-                    InventoryStack
-                        .GetStackCount(
-                            player,
-                            (byte)slotId);
-
-                if (quantity != null)
-                {
-                    quantity.text =
-                        stackCount >
-                            1
-                            ? "x" +
-                              stackCount
-                            : string.Empty;
-                }
-
-                if (name != null)
-                {
-                    name.text =
-                        GetItemDisplayName(
-                            slot.prefab);
-                }
-            }
-        }
-
-        private sealed class SellView
-        {
-            public readonly GameObject Root;
-
-            private readonly List<SellSlotView>
-                slots;
-
-            private readonly RawImage detailIcon;
-            private readonly TextMeshProUGUI selectedText;
-            private readonly TextMeshProUGUI status;
-            private readonly Button action;
-
-            public SellView(
-                GameObject root,
-                List<SellSlotView> slotViews,
-                RawImage selectedIcon,
-                TextMeshProUGUI selectedItemText,
-                TextMeshProUGUI statusText,
-                Button actionButton)
-            {
-                Root =
-                    root;
-
-                slots =
-                    slotViews;
-
-                detailIcon =
-                    selectedIcon;
-
-                selectedText =
-                    selectedItemText;
-
-                status =
-                    statusText;
-
-                action =
-                    actionButton;
-            }
-
-            public void Refresh(
-                CraftHub owner)
-            {
-                for (int i = 0;
-                     i < slots.Count;
-                     i++)
-                {
-                    slots[i].Refresh(
-                        owner);
-                }
-
-                bool canSell;
-
-                string text =
-                    owner
-                        .BuildSelectedSellText(
-                            out canSell);
-
-                if (selectedText != null)
-                {
-                    selectedText.text =
-                        text;
-                }
-
-                if (status != null)
-                {
-                    status.text =
-                        owner.sellStatus;
-                }
-
-                global::Player player =
-                    global::Player
-                        .localPlayer;
-
-                ItemSlot selectedSlot =
-                    null;
-
-                if (player != null &&
-                    player.itemSlots !=
-                        null &&
-                    owner.SelectedSellSlotId >=
-                        0 &&
-                    owner.SelectedSellSlotId <
-                        player.itemSlots.Length)
-                {
-                    selectedSlot =
-                        player.GetItemSlot(
-                            (byte)owner
-                                .SelectedSellSlotId);
-                }
-
-                if (detailIcon != null)
-                {
-                    detailIcon.texture =
-                        selectedSlot !=
-                            null &&
-                        !selectedSlot.IsEmpty() &&
-                        selectedSlot.prefab !=
-                            null &&
-                        selectedSlot.prefab
-                            .UIData !=
-                            null
-                            ? selectedSlot
-                                .prefab
-                                .UIData
-                                .GetIcon()
-                            : null;
-
-                    detailIcon.enabled =
-                        detailIcon.texture !=
-                        null;
-                }
-
-                if (action != null)
-                {
-                    action.interactable =
-                        canSell &&
-                        owner.pendingRequest ==
-                            PendingRequest.None;
-
-                    TextMeshProUGUI label =
-                        action
-                            .GetComponentInChildren<
-                                TextMeshProUGUI>();
-
-                    if (label != null)
-                    {
-                        label.text =
-                            owner.pendingRequest ==
-                                PendingRequest.Sell
-                                ? "처리 중..."
-                                : "1개 판매";
-                    }
-                }
+                SetInteractableIfChanged(
+                    button,
+                    true);
             }
         }
 
         private sealed class CraftHubWindow :
             MenuWindow
         {
-            private const float RefreshIntervalSeconds = 0.15f;
-
             private CraftHub owner;
-            private float nextRefreshAt;
 
-            private List<TabButtonView>
-                tabs =
-                    new List<
-                        TabButtonView>();
+            private List<LiteTabView> tabs =
+                new List<LiteTabView>();
 
-            private TextMeshProUGUI balance;
+            private List<LiteRowView> rows =
+                new List<LiteRowView>();
+
             private TextMeshProUGUI title;
+            private TextMeshProUGUI balance;
+            private TextMeshProUGUI explanation;
+            private GameObject detailPanel;
+            private TextMeshProUGUI detail;
+            private TextMeshProUGUI status;
+            private TextMeshProUGUI actionLabel;
+            private TextMeshProUGUI page;
 
-            private UpgradeView upgradeView;
-            private CraftView craftView;
-            private SellView sellView;
-
-            private Button closeButton;
+            private Button action;
+            private Button previous;
+            private Button next;
+            private Button close;
 
             public override bool closeOnPause
             {
@@ -8881,7 +9467,8 @@ namespace CraftPeak
             {
                 get
                 {
-                    return closeButton;
+                    return
+                        close;
                 }
             }
 
@@ -8893,61 +9480,68 @@ namespace CraftPeak
             }
 
             public void SetReferences(
-                List<TabButtonView> tabViews,
-                TextMeshProUGUI balanceText,
+                List<LiteTabView> tabViews,
+                List<LiteRowView> rowViews,
                 TextMeshProUGUI titleText,
-                UpgradeView upgrade,
-                CraftView craft,
-                SellView sell,
-                Button close)
+                TextMeshProUGUI balanceText,
+                TextMeshProUGUI explanationText,
+                GameObject detailPanelObject,
+                TextMeshProUGUI detailText,
+                TextMeshProUGUI statusText,
+                Button actionButton,
+                TextMeshProUGUI actionButtonLabel,
+                TextMeshProUGUI pageText,
+                Button previousButton,
+                Button nextButton,
+                Button closeButton)
             {
                 tabs =
                     tabViews ??
-                    new List<
-                        TabButtonView>();
+                    new List<LiteTabView>();
 
-                balance =
-                    balanceText;
+                rows =
+                    rowViews ??
+                    new List<LiteRowView>();
 
                 title =
                     titleText;
 
-                upgradeView =
-                    upgrade;
+                balance =
+                    balanceText;
 
-                craftView =
-                    craft;
+                explanation =
+                    explanationText;
 
-                sellView =
-                    sell;
+                detailPanel =
+                    detailPanelObject;
 
-                closeButton =
-                    close;
-            }
+                detail =
+                    detailText;
 
-            protected override void Update()
-            {
-                base.Update();
+                status =
+                    statusText;
 
-                if (!isOpen ||
-                    Time.unscaledTime <
-                        nextRefreshAt)
-                {
-                    return;
-                }
+                action =
+                    actionButton;
 
-                nextRefreshAt =
-                    Time.unscaledTime +
-                    RefreshIntervalSeconds;
+                actionLabel =
+                    actionButtonLabel;
 
-                RefreshContents();
+                page =
+                    pageText;
+
+                previous =
+                    previousButton;
+
+                next =
+                    nextButton;
+
+                close =
+                    closeButton;
             }
 
             protected override void OnOpen()
             {
-                nextRefreshAt =
-                    0f;
-
                 RefreshContents();
             }
 
@@ -8958,90 +9552,415 @@ namespace CraftPeak
                     return;
                 }
 
-                HubTab selected =
-                    owner.CurrentTab;
+                HubTab tab =
+                    owner.currentTab;
 
                 for (int i = 0;
                      i < tabs.Count;
                      i++)
                 {
                     tabs[i].Refresh(
-                        selected);
+                        tab);
                 }
 
-                if (balance != null)
+                SetTextIfChanged(
+                    balance,
+                    "공유 잔액: " +
+                    owner.cachedSharedMoney +
+                    "원");
+
+                SetActiveIfChanged(
+                    explanation != null
+                        ? explanation.gameObject
+                        : null,
+                    tab ==
+                    HubTab.Description);
+
+                SetActiveIfChanged(
+                    detailPanel,
+                    tab !=
+                    HubTab.Description);
+
+                switch (tab)
                 {
-                    balance.text =
-                        "공유 잔액: " +
-                        owner.SharedMoney +
-                        "원";
-                }
+                    case HubTab.Description:
+                        RefreshDescription();
+                        break;
 
-                if (title != null)
+                    case HubTab.Upgrade:
+                        RefreshUpgrade();
+                        break;
+
+                    case HubTab.Craft:
+                        RefreshCraft();
+                        break;
+
+                    case HubTab.Sell:
+                        RefreshSell();
+                        break;
+
+                    case HubTab.Parts:
+                        RefreshParts();
+                        break;
+                }
+            }
+
+            private void RefreshDescription()
+            {
+                SetTextIfChanged(
+                    title,
+                    "설명");
+
+                for (int i = 0;
+                     i < rows.Count;
+                     i++)
                 {
-                    switch (selected)
-                    {
-                        case HubTab.Upgrade:
-                            title.text =
-                                "강화";
-                            break;
-
-                        case HubTab.Craft:
-                            title.text =
-                                "제작";
-                            break;
-
-                        case HubTab.Sell:
-                            title.text =
-                                "판매";
-                            break;
-                    }
+                    rows[i].Refresh(
+                        false,
+                        false,
+                        string.Empty);
                 }
 
-                if (upgradeView != null)
+                SetActiveIfChanged(
+                    page.gameObject,
+                    false);
+
+                SetActiveIfChanged(
+                    previous.gameObject,
+                    false);
+
+                SetActiveIfChanged(
+                    next.gameObject,
+                    false);
+
+                SetActiveIfChanged(
+                    action.gameObject,
+                    false);
+
+                SetTextIfChanged(
+                    explanation,
+                    BuildExplanationText());
+            }
+
+            private void PrepareInteractiveTab()
+            {
+                SetActiveIfChanged(
+                    action.gameObject,
+                    true);
+
+                SetActiveIfChanged(
+                    detailPanel,
+                    true);
+            }
+
+            private void RefreshUpgrade()
+            {
+                PrepareInteractiveTab();
+                SetTextIfChanged(
+                    title,
+                    "강화");
+
+                for (int i = 0;
+                     i < rows.Count;
+                     i++)
                 {
-                    upgradeView.Root
-                        .SetActive(
-                            selected ==
-                            HubTab.Upgrade);
+                    bool active =
+                        i <=
+                        (int)UpgradeKind.DoubleYield;
 
-                    if (selected ==
-                        HubTab.Upgrade)
-                    {
-                        upgradeView.Refresh(
-                            owner);
-                    }
+                    UpgradeKind kind =
+                        active
+                            ? (UpgradeKind)i
+                            : UpgradeKind.ResourceGrade;
+
+                    rows[i].Refresh(
+                        active,
+                        active &&
+                        owner.selectedUpgradeKind ==
+                            kind,
+                        active
+                            ? owner.BuildUpgradeRowText(
+                                kind)
+                            : string.Empty);
                 }
 
-                if (craftView != null)
+                SetActiveIfChanged(
+                    page.gameObject,
+                    false);
+
+                SetActiveIfChanged(
+                    previous.gameObject,
+                    false);
+
+                SetActiveIfChanged(
+                    next.gameObject,
+                    false);
+
+                SetTextIfChanged(
+                    detail,
+                    BuildUpgradeDetailText(
+                        owner));
+
+                SetTextIfChanged(
+                    status,
+                    owner.upgradeStatus);
+
+                bool maximumReached =
+                    owner
+                        .SelectedUpgradeCurrentLevel >=
+                    owner
+                        .SelectedUpgradeMaximumLevel;
+
+                SetInteractableIfChanged(
+                    action,
+                    owner
+                        .CanAttemptUpgrade);
+
+                SetTextIfChanged(
+                    actionLabel,
+                    maximumReached
+                        ? "최대 단계"
+                        : (
+                            owner.pendingRequest ==
+                                PendingRequest.Upgrade
+                                ? "처리 중..."
+                                : "강화 시도"
+                        ));
+            }
+
+            private void RefreshCraft()
+            {
+                PrepareInteractiveTab();
+
+                SetTextIfChanged(
+                    title,
+                    "제작");
+
+                CraftRecipe selected =
+                    owner
+                        .SelectedCraftRecipe;
+
+                for (int i = 0;
+                     i < rows.Count;
+                     i++)
                 {
-                    craftView.Root
-                        .SetActive(
-                            selected ==
-                            HubTab.Craft);
+                    CraftRecipe recipe =
+                        owner
+                            .GetCraftRecipeAtCard(
+                                i);
 
-                    if (selected ==
-                        HubTab.Craft)
-                    {
-                        craftView.Refresh(
-                            owner);
-                    }
+                    rows[i].Refresh(
+                        recipe != null,
+                        recipe != null &&
+                        selected != null &&
+                        recipe.OutputItemId ==
+                            selected.OutputItemId,
+                        BuildCraftRowText(
+                            recipe));
                 }
 
-                if (sellView != null)
+                SetActiveIfChanged(
+                    page.gameObject,
+                    true);
+
+                SetActiveIfChanged(
+                    previous.gameObject,
+                    true);
+
+                SetActiveIfChanged(
+                    next.gameObject,
+                    true);
+
+                SetTextIfChanged(
+                    page,
+                    "페이지 " +
+                    (
+                        owner.craftPage +
+                        1
+                    ) +
+                    " / " +
+                    owner.CraftTotalPages);
+
+                SetInteractableIfChanged(
+                    previous,
+                    owner.craftPage >
+                    0);
+
+                SetInteractableIfChanged(
+                    next,
+                    owner.craftPage <
+                    owner.CraftTotalPages -
+                    1);
+
+                bool ready;
+
+                SetTextIfChanged(
+                    detail,
+                    BuildCraftDetailText(
+                        owner,
+                        selected,
+                        out ready));
+
+                SetTextIfChanged(
+                    status,
+                    owner.craftStatus);
+
+                SetInteractableIfChanged(
+                    action,
+                    selected != null &&
+                    ready &&
+                    owner.pendingRequest ==
+                        PendingRequest.None);
+
+                SetTextIfChanged(
+                    actionLabel,
+                    owner.pendingRequest ==
+                        PendingRequest.Craft
+                        ? "처리 중..."
+                        : "제작 시도");
+            }
+
+            private void RefreshSell()
+            {
+                PrepareInteractiveTab();
+
+                SetTextIfChanged(
+                    title,
+                    "판매");
+
+                global::Player player =
+                    global::Player.localPlayer;
+
+                int slotCount =
+                    player != null &&
+                    player.itemSlots != null
+                        ? Mathf.Min(
+                            rows.Count,
+                            player.itemSlots.Length)
+                        : 0;
+
+                for (int i = 0;
+                     i < rows.Count;
+                     i++)
                 {
-                    sellView.Root
-                        .SetActive(
-                            selected ==
-                            HubTab.Sell);
+                    bool active =
+                        i <
+                        slotCount;
 
-                    if (selected ==
-                        HubTab.Sell)
-                    {
-                        sellView.Refresh(
-                            owner);
-                    }
+                    rows[i].Refresh(
+                        active,
+                        active &&
+                        owner.selectedSellSlotId ==
+                            i,
+                        active
+                            ? BuildSellRowText(
+                                i)
+                            : string.Empty);
                 }
+
+                SetActiveIfChanged(
+                    page.gameObject,
+                    false);
+
+                SetActiveIfChanged(
+                    previous.gameObject,
+                    false);
+
+                SetActiveIfChanged(
+                    next.gameObject,
+                    false);
+
+                bool canSell;
+
+                string selectedText =
+                    owner
+                        .BuildSelectedSellText(
+                            out canSell);
+
+                SetTextIfChanged(
+                    detail,
+                    selectedText +
+                    "\n\n가격표\nCommon 1원 · Normal 3원\nRare 7원 · Unique 15원\nLegendary 50원");
+
+                SetTextIfChanged(
+                    status,
+                    owner.sellStatus);
+
+                SetInteractableIfChanged(
+                    action,
+                    canSell &&
+                    owner.pendingRequest ==
+                        PendingRequest.None);
+
+                SetTextIfChanged(
+                    actionLabel,
+                    owner.pendingRequest ==
+                        PendingRequest.Sell
+                        ? "처리 중..."
+                        : "1개 판매");
+            }
+
+            private void RefreshParts()
+            {
+                PrepareInteractiveTab();
+
+                SetTextIfChanged(
+                    title,
+                    "부품");
+
+                for (int i = 0;
+                     i < rows.Count;
+                     i++)
+                {
+                    bool active =
+                        i <
+                        PlanePartRecipes.Length;
+
+                    rows[i].Refresh(
+                        active,
+                        active &&
+                        owner.selectedPartIndex ==
+                            i,
+                        active
+                            ? owner.BuildPartRowText(
+                                i)
+                            : string.Empty);
+                }
+
+                SetActiveIfChanged(
+                    page.gameObject,
+                    false);
+
+                SetActiveIfChanged(
+                    previous.gameObject,
+                    false);
+
+                SetActiveIfChanged(
+                    next.gameObject,
+                    false);
+
+                bool ready;
+
+                SetTextIfChanged(
+                    detail,
+                    owner.BuildPartDetailText(
+                        owner.SelectedPartRecipe,
+                        out ready));
+
+                SetTextIfChanged(
+                    status,
+                    owner.partsStatus);
+
+                SetInteractableIfChanged(
+                    action,
+                    ready);
+
+                SetTextIfChanged(
+                    actionLabel,
+                    owner.pendingRequest ==
+                        PendingRequest.Parts
+                        ? "처리 중..."
+                        : "부품 구매");
             }
         }
     }
@@ -9140,25 +10059,684 @@ namespace CraftPeak
     }
 
     /// <summary>
-    /// 기존 Connect.cs의 Shop.PluginGuid 참조를 유지하기 위한 호환 별칭입니다.
-    /// 판매 기능과 플러그인 본체는 CraftHub 하나에만 존재합니다.
+    /// CampfireGate가 재료를 소비하기 전에 제작 등급과 비행기 부품을
+    /// 호스트 권한으로 검증합니다.
     /// </summary>
-    public static class Shop
+    [HarmonyPatch(
+        typeof(CampfireGate),
+        "ProcessIgniteRequestOnHost")]
+    internal static class
+        CraftHubCampfireProgressionGatePatch
+    {
+        [HarmonyPrefix]
+        private static bool Prefix(
+            int __0,
+            object[] __1)
+        {
+            int requesterActorNumber =
+                __0;
+
+            object[] requestData =
+                __1;
+
+            if (CraftHub.Instance == null ||
+                !PhotonNetwork.IsMasterClient)
+            {
+                return true;
+            }
+
+            if (!CraftHub.IsCurrentCampfireRequest(
+                    requestData))
+            {
+                CraftHub.Instance
+                    .SendProgressionNotice(
+                        requesterActorNumber,
+                        "현재 구간의 모닥불만 다음 세그먼트 진행에 사용할 수 있습니다.");
+
+                return false;
+            }
+
+            string message;
+
+            if (CraftHub.ValidateCampfireProgression(
+                    out message))
+            {
+                return true;
+            }
+
+            CraftHub.Instance
+                .SendProgressionNotice(
+                    requesterActorNumber,
+                    message);
+
+            return false;
+        }
+    }
+
+    /// <summary>
+    /// 원본 모닥불 재료 안내 아래에 제작 등급과 비행기 부품 진행 조건을 표시합니다.
+    /// </summary>
+    [HarmonyPatch(
+        typeof(global::Campfire),
+        "GetInteractionText")]
+    internal static class
+        CraftHubCampfireProgressionPromptPatch
+    {
+        [HarmonyPostfix]
+        private static void Postfix(
+            global::Campfire __instance,
+            ref string __result)
+        {
+            if (CraftHub.Instance == null ||
+                __instance == null ||
+                __instance.isPyre ||
+                !CraftHub.IsCurrentSegmentCampfire(
+                    __instance) ||
+                __instance.Lit ||
+                __instance.state !=
+                    global::Campfire
+                        .FireState
+                        .Off)
+            {
+                return;
+            }
+
+            __result +=
+                CraftHub
+                    .BuildCampfireProgressionPrompt();
+        }
+    }
+
+    /// <summary>
+    /// 모닥불 점화가 실제로 성공한 뒤 현재 구간의 비행기 부품을 사용 완료로 저장합니다.
+    /// </summary>
+    [HarmonyPatch(
+        typeof(global::Campfire),
+        "Light_Rpc")]
+    internal static class
+        CraftHubCampfirePartConsumePatch
+    {
+        [HarmonyPrefix]
+        private static void Prefix(
+            global::Campfire __instance,
+            ref int __state)
+        {
+            __state =
+                -1;
+
+            if (CraftHub.Instance == null ||
+                __instance == null ||
+                __instance.isPyre ||
+                !CraftHub.IsCurrentSegmentCampfire(
+                    __instance))
+            {
+                return;
+            }
+
+            __state =
+                (int)MapHandler
+                    .CurrentSegmentNumber;
+        }
+
+        [HarmonyPostfix]
+        private static void Postfix(
+            int __state)
+        {
+            if (CraftHub.Instance == null ||
+                __state <
+                    (int)Segment.Beach ||
+                __state >
+                    (int)Segment.Caldera)
+            {
+                return;
+            }
+
+            CraftHub.Instance
+                .CloseHub();
+
+            if (!PhotonNetwork.IsMasterClient)
+            {
+                return;
+            }
+
+            CraftHub.Instance
+                .MarkPartConsumedAfterCampfire(
+                    __state);
+        }
+    }
+
+    /// <summary>
+    /// 기존 Open/Shop.cs를 제거해도 Shop 참조가 남아 있는 다른 소스가
+    /// 컴파일되도록 제공하는 경량 호환 파사드입니다.
+    ///
+    /// 실제 플러그인, 판매 상태, UI 및 네트워크 처리는 모두 CraftHub가 담당합니다.
+    /// </summary>
+    public sealed class Shop
     {
         public const string PluginGuid =
             CraftHub.PluginGuid;
+
+        public const string PluginName =
+            CraftHub.PluginName;
+
+        public const string PluginVersion =
+            CraftHub.PluginVersion;
+
+        private static readonly Shop FacadeInstance =
+            new Shop();
+
+        private Shop()
+        {
+        }
+
+        public static Shop Instance
+        {
+            get
+            {
+                return
+                    CraftHub.Instance != null
+                        ? FacadeInstance
+                        : null;
+            }
+        }
 
         public static int SharedMoney
         {
             get
             {
                 return
-                    CraftHub.Instance !=
-                        null
+                    CraftHub.Instance != null
                         ? CraftHub.Instance
                             .SharedMoney
                         : 0;
             }
         }
+
+        public void OpenShop()
+        {
+            if (CraftHub.Instance != null)
+            {
+                CraftHub.Instance
+                    .OpenCompatibilityTab(
+                        CraftHub.HubTab.Sell);
+            }
+        }
+
+        public void CloseShop()
+        {
+            if (CraftHub.Instance != null)
+            {
+                CraftHub.Instance
+                    .CloseHub();
+            }
+        }
+
+        internal void SelectInventorySlot(
+            byte slotId)
+        {
+            if (CraftHub.Instance != null)
+            {
+                CraftHub.Instance
+                    .SelectSellSlot(
+                        slotId);
+            }
+        }
+
+        internal string BuildSelectedItemText(
+            out bool canSell)
+        {
+            if (CraftHub.Instance == null)
+            {
+                canSell =
+                    false;
+
+                return
+                    "CraftHub가 아직 준비되지 않았습니다.";
+            }
+
+            return
+                CraftHub.Instance
+                    .BuildSelectedSellText(
+                        out canSell);
+        }
+
+        internal bool IsSellRequestPending()
+        {
+            return
+                CraftHub.Instance != null &&
+                CraftHub.Instance
+                    .IsPending(
+                        CraftHub.PendingRequest.Sell);
+        }
+
+        internal void RefreshWindow()
+        {
+            if (CraftHub.Instance != null)
+            {
+                CraftHub.Instance
+                    .RefreshCompatibilityWindow();
+            }
+        }
     }
+
+    /// <summary>
+    /// 기존 Store.cs를 제거해도 Store 참조가 남아 있는 다른 소스가
+    /// 컴파일되도록 제공하는 경량 호환 파사드입니다.
+    ///
+    /// 제작식, 재료 소비, 성공 판정 및 완성품 지급은 CraftHub가 직접 처리합니다.
+    /// </summary>
+    public sealed class Store
+    {
+        public const string PluginGuid =
+            CraftHub.PluginGuid;
+
+        public const string PluginName =
+            CraftHub.PluginName;
+
+        public const string PluginVersion =
+            CraftHub.PluginVersion;
+
+        private static readonly Store FacadeInstance =
+            new Store();
+
+        private Store()
+        {
+        }
+
+        public static Store Instance
+        {
+            get
+            {
+                return
+                    CraftHub.Instance != null
+                        ? FacadeInstance
+                        : null;
+            }
+        }
+
+        public void OpenStore()
+        {
+            if (CraftHub.Instance != null)
+            {
+                CraftHub.Instance
+                    .OpenCompatibilityTab(
+                        CraftHub.HubTab.Craft);
+            }
+        }
+
+        public void CloseStore()
+        {
+            if (CraftHub.Instance != null)
+            {
+                CraftHub.Instance
+                    .CloseHub();
+            }
+        }
+
+        internal int GetSharedMoney()
+        {
+            return
+                CraftHub.Instance != null
+                    ? CraftHub.Instance
+                        .SharedMoney
+                    : 0;
+        }
+
+        internal bool IsRequestPending()
+        {
+            return
+                CraftHub.Instance != null &&
+                CraftHub.Instance
+                    .IsPending(
+                        CraftHub.PendingRequest.Craft);
+        }
+
+        internal void RefreshWindow()
+        {
+            if (CraftHub.Instance != null)
+            {
+                CraftHub.Instance
+                    .RefreshCompatibilityWindow();
+            }
+        }
+    }
+
+    /// <summary>
+    /// 기존 Upgrade.cs를 제거해도 Upgrade 참조가 남아 있는 다른 소스가
+    /// 컴파일되도록 제공하는 경량 호환 파사드입니다.
+    ///
+    /// 강화 단계, 확률, 효과 적용 및 Photon 상태 보존은 CraftHub가 직접 처리합니다.
+    /// </summary>
+    public sealed class Upgrade
+    {
+        public const string PluginGuid =
+            CraftHub.PluginGuid;
+
+        public const string PluginName =
+            CraftHub.PluginName;
+
+        public const string PluginVersion =
+            CraftHub.PluginVersion;
+
+        public enum UpgradeKind
+        {
+            ResourceGrade = 0,
+            GatherSpeed = 1,
+            StackCapacity = 2,
+            CampfireEfficiency = 3,
+            DoubleYield = 4
+        }
+
+        private static readonly Upgrade FacadeInstance =
+            new Upgrade();
+
+        private Upgrade()
+        {
+        }
+
+        public static Upgrade Instance
+        {
+            get
+            {
+                return
+                    CraftHub.Instance != null
+                        ? FacadeInstance
+                        : null;
+            }
+        }
+
+        public static int ResourceYieldMultiplier
+        {
+            get
+            {
+                return
+                    CraftHub
+                        .ResourceYieldMultiplier;
+            }
+        }
+
+        public static int ResourceUpgradeLevel
+        {
+            get
+            {
+                return
+                    CraftHub
+                        .ResourceUpgradeLevel;
+            }
+        }
+
+        public static int GatherUpgradeLevel
+        {
+            get
+            {
+                return
+                    CraftHub
+                        .GatherUpgradeLevel;
+            }
+        }
+
+        public static int StackUpgradeLevel
+        {
+            get
+            {
+                return
+                    CraftHub
+                        .StackUpgradeLevel;
+            }
+        }
+
+        public static int CampfireUpgradeLevel
+        {
+            get
+            {
+                return
+                    CraftHub
+                        .CampfireUpgradeLevel;
+            }
+        }
+
+        public static bool DoubleYieldUnlocked
+        {
+            get
+            {
+                return
+                    CraftHub
+                        .DoubleYieldUnlocked;
+            }
+        }
+
+        internal UpgradeKind SelectedKind
+        {
+            get
+            {
+                return
+                    CraftHub.Instance != null
+                        ? ToCompatibilityKind(
+                            CraftHub.Instance
+                                .SelectedUpgradeKind)
+                        : UpgradeKind.ResourceGrade;
+            }
+        }
+
+        internal int SelectedCurrentLevel
+        {
+            get
+            {
+                return
+                    CraftHub.Instance != null
+                        ? CraftHub.Instance
+                            .SelectedUpgradeCurrentLevel
+                        : 0;
+            }
+        }
+
+        internal int SelectedMaximumLevel
+        {
+            get
+            {
+                return
+                    CraftHub.Instance != null
+                        ? CraftHub.Instance
+                            .SelectedUpgradeMaximumLevel
+                        : 0;
+            }
+        }
+
+        internal int SelectedCost
+        {
+            get
+            {
+                return
+                    CraftHub.Instance != null
+                        ? CraftHub.Instance
+                            .SelectedUpgradeCost
+                        : 0;
+            }
+        }
+
+        internal float SelectedChance
+        {
+            get
+            {
+                return
+                    CraftHub.Instance != null
+                        ? CraftHub.Instance
+                            .SelectedUpgradeChance
+                        : 0f;
+            }
+        }
+
+        internal bool CanAttempt
+        {
+            get
+            {
+                return
+                    CraftHub.Instance != null &&
+                    CraftHub.Instance
+                        .CanAttemptUpgrade;
+            }
+        }
+
+        internal bool RequestPending
+        {
+            get
+            {
+                return
+                    CraftHub.Instance != null &&
+                    CraftHub.Instance
+                        .IsPending(
+                            CraftHub.PendingRequest.Upgrade);
+            }
+        }
+
+        internal bool FailureActive
+        {
+            get
+            {
+                return
+                    CraftHub.Instance != null &&
+                    CraftHub.Instance
+                        .UpgradeFailureActive;
+            }
+        }
+
+        internal bool FailureConsumesCost
+        {
+            get
+            {
+                return
+                    CraftHub.Instance != null &&
+                    CraftHub.Instance
+                        .UpgradeFailureConsumesCost;
+            }
+        }
+
+        internal int SharedMoney
+        {
+            get
+            {
+                return
+                    CraftHub.Instance != null
+                        ? CraftHub.Instance
+                            .SharedMoney
+                        : 0;
+            }
+        }
+
+        public void OpenWindow()
+        {
+            if (CraftHub.Instance != null)
+            {
+                CraftHub.Instance
+                    .OpenCompatibilityTab(
+                        CraftHub.HubTab.Upgrade);
+            }
+        }
+
+        public void CloseUpgradeWindow()
+        {
+            if (CraftHub.Instance != null)
+            {
+                CraftHub.Instance
+                    .CloseHub();
+            }
+        }
+
+        internal void SelectKind(
+            UpgradeKind kind)
+        {
+            if (CraftHub.Instance != null)
+            {
+                CraftHub.Instance
+                    .SelectUpgradeKind(
+                        ToHubKind(
+                            kind));
+            }
+        }
+
+        internal string DisplayName(
+            UpgradeKind kind)
+        {
+            return
+                CraftHub.Instance != null
+                    ? CraftHub.Instance
+                        .GetUpgradeDisplayName(
+                            ToHubKind(
+                                kind))
+                    : kind.ToString();
+        }
+
+        internal string CurrentEffect(
+            UpgradeKind kind)
+        {
+            return
+                CraftHub.Instance != null
+                    ? CraftHub.Instance
+                        .GetUpgradeCurrentEffect(
+                            ToHubKind(
+                                kind))
+                    : string.Empty;
+        }
+
+        internal string NextEffect(
+            UpgradeKind kind)
+        {
+            return
+                CraftHub.Instance != null
+                    ? CraftHub.Instance
+                        .GetUpgradeNextEffect(
+                            ToHubKind(
+                                kind))
+                    : string.Empty;
+        }
+
+        internal void RefreshWindow()
+        {
+            if (CraftHub.Instance != null)
+            {
+                CraftHub.Instance
+                    .RefreshCompatibilityWindow();
+            }
+        }
+
+        internal static int CountResource(
+            global::Player player,
+            ushort itemId)
+        {
+            return
+                CraftHub
+                    .CountPlayerResourceUnits(
+                        player,
+                        itemId);
+        }
+
+        internal static void GrantBonus(
+            global::Player player,
+            ushort itemId,
+            int countBefore)
+        {
+            CraftHub
+                .GrantPickupBonus(
+                    player,
+                    itemId,
+                    countBefore);
+        }
+
+        private static CraftHub.UpgradeKind ToHubKind(
+            UpgradeKind kind)
+        {
+            return
+                (CraftHub.UpgradeKind)
+                    (int)kind;
+        }
+
+        private static UpgradeKind ToCompatibilityKind(
+            CraftHub.UpgradeKind kind)
+        {
+            return
+                (UpgradeKind)
+                    (int)kind;
+        }
+    }
+
 }
