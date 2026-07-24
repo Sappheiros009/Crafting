@@ -1,4 +1,4 @@
-// CRAFT PEAK UNIFIED HUB - PROGRESSION ON-DEMAND BUILD 2.2.1
+// CRAFT PEAK UNIFIED HUB - PROGRESSION ON-DEMAND BUILD 2.2.2
 //
 // Developer: Sapphire009
 // Project: Craft PEAK
@@ -80,7 +80,7 @@ namespace CraftPeak
             "Craft PEAK Unified Hub";
 
         public const string PluginVersion =
-            "2.2.1";
+            "2.2.2";
 
         public const string DeveloperName =
             "Sapphire009";
@@ -10129,7 +10129,6 @@ namespace CraftPeak
         {
             if (CraftHub.Instance == null ||
                 __instance == null ||
-                __instance.isPyre ||
                 !CraftHub.IsCurrentSegmentCampfire(
                     __instance) ||
                 __instance.Lit ||
@@ -10166,7 +10165,6 @@ namespace CraftPeak
 
             if (CraftHub.Instance == null ||
                 __instance == null ||
-                __instance.isPyre ||
                 !CraftHub.IsCurrentSegmentCampfire(
                     __instance))
             {
