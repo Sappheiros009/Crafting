@@ -1,4 +1,4 @@
-// CAMPFIRE MATERIAL GATE + MODCONFIG BUILD 1.1.0
+// CAMPFIRE MATERIAL GATE + MODCONFIG BUILD 1.1.1
 //
 // 기능
 // - 일반 모닥불 점화 조건은 ModConfig에서 조절할 수 있습니다.
@@ -65,7 +65,7 @@ namespace CraftPeak
             "Craft PEAK Campfire Materials";
 
         public const string PluginVersion =
-            "1.1.0";
+            "1.1.1";
 
         public const ushort FireWoodItemId = 28;
         public const ushort StoneItemId = 72;
@@ -527,10 +527,25 @@ namespace CraftPeak
         internal static bool IsManagedCampfire(
             global::Campfire campfire)
         {
-            return
-                IsGameplayActive() &&
-                campfire != null &&
-                !campfire.isPyre;
+            if (!IsGameplayActive() ||
+                campfire == null)
+            {
+                return false;
+            }
+
+            try
+            {
+                // 현재 PEAK의 Campfire 클래스에는 isPyre 멤버가 없습니다.
+                // MapHandler가 관리하는 현재 구간 모닥불만 대상으로 삼으면
+                // 일반 진행용 모닥불에는 적용되고 최종 Pyre는 자연스럽게 제외됩니다.
+                return
+                    MapHandler.CurrentCampfire ==
+                    campfire;
+            }
+            catch (Exception)
+            {
+                return false;
+            }
         }
 
         private static bool IsExcludedScene(
