@@ -1,4 +1,4 @@
-// MAP-WIDE RARITY SPAWN + MODCONFIG BUILD 1.6.0
+// MAP-WIDE RARITY SPAWN + MODCONFIG BUILD 1.6.1
 //
 // 목표
 // - 맵 전체에 판매용 자원 3000개를 공간 밀도에 맞춰 골고루 분산
@@ -51,7 +51,7 @@ namespace CraftPeak
             "Craft PEAK Map Wide Fixed Slot Spawn";
 
         public const string PluginVersion =
-            "1.6.0";
+            "1.6.1";
 
         private const int TargetSlotCount = 3000;
 
@@ -3463,30 +3463,28 @@ namespace CraftPeak
                     SaleResourceIds[i]] = 0;
             }
 
-            if (Item.ALL_ITEMS != null)
+            Item[] snapshot =
+                UnityEngine.Object.FindObjectsByType<Item>(
+                    FindObjectsInactive.Include,
+                    FindObjectsSortMode.None);
+
+            for (int i = 0;
+                 i <
+                     snapshot.Length;
+                 i++)
             {
-                List<Item> snapshot =
-                    new List<Item>(
-                        Item.ALL_ITEMS);
+                Item item =
+                    snapshot[i];
 
-                for (int i = 0;
-                     i <
-                         snapshot.Count;
-                     i++)
+                if (item == null ||
+                    !IsSaleResourceId(
+                        item.itemID))
                 {
-                    Item item =
-                        snapshot[i];
-
-                    if (item == null ||
-                        !IsSaleResourceId(
-                            item.itemID))
-                    {
-                        continue;
-                    }
-
-                    counts[
-                        item.itemID]++;
+                    continue;
                 }
+
+                counts[
+                    item.itemID]++;
             }
 
             string message =
