@@ -28,7 +28,7 @@ namespace CraftPeak
     {
         public const string PluginGuid = "com.sappheiros.crafting.delete";
         public const string PluginName = "Craft PEAK Delete";
-        public const string PluginVersion = "1.0.1";
+        public const string PluginVersion = "1.1.0";
 
         /// <summary>
         /// 사용자가 인게임에서 직접 확인한 모든 World.itemID입니다.
@@ -51,11 +51,15 @@ namespace CraftPeak
                 165
             };
 
-        private readonly HashSet<int> scheduledItemInstanceIds =
+        private readonly HashSet<int> initialFieldItemInstanceIds =
             new HashSet<int>();
 
         private Harmony harmony;
-        private bool blockGameplaySpawns;
+
+        // true인 동안에만 원본 필드 Spawner를 차단합니다.
+        // 초기 정리 완료 뒤에는 false가 되어 제작/모드 스폰 아이템을 유지합니다.
+        private bool initialCleanupActive;
+
         private int loadedSceneHandle = -1;
 
         internal static Delete Instance { get; private set; }
@@ -76,8 +80,9 @@ namespace CraftPeak
                 LoadSceneMode.Single);
 
             Logger.LogInfo(
-                "Craft PEAK Delete 1.0.1 loaded. " +
-                "Original gameplay item spawns will be blocked.");
+                "Craft PEAK Delete 1.1.0 loaded. " +
+                "Only the initial field items will be removed. " +
+                "Items crafted or spawned after initial cleanup will be preserved.");
         }
 
         private void OnDestroy()
@@ -90,7 +95,7 @@ namespace CraftPeak
                 harmony = null;
             }
 
-            scheduledItemInstanceIds.Clear();
+            initialFieldItemInstanceIds.Clear();
 
             if (Instance == this)
             {
@@ -103,12 +108,12 @@ namespace CraftPeak
             LoadSceneMode loadSceneMode)
         {
             StopAllCoroutines();
-            scheduledItemInstanceIds.Clear();
+            initialFieldItemInstanceIds.Clear();
 
             loadedSceneHandle = scene.handle;
-            blockGameplaySpawns = IsGameplayScene(scene);
+            initialCleanupActive = IsGameplayScene(scene);
 
-            if (!blockGameplaySpawns)
+            if (!initialCleanupActive)
             {
                 Logger.LogInfo(
                     "Item deletion disabled in scene: " +
@@ -118,7 +123,7 @@ namespace CraftPeak
             }
 
             Logger.LogInfo(
-                "Gameplay scene detected. Blocking original item spawns: " +
+                "Gameplay scene detected. Starting one-time initial field cleanup: " +
                 scene.name);
 
             StartCoroutine(
@@ -149,7 +154,7 @@ namespace CraftPeak
 
         internal bool ShouldBlockOriginalSpawner()
         {
-            return blockGameplaySpawns &&
+            return initialCleanupActive &&
                    loadedSceneHandle ==
                    SceneManager.GetActiveScene().handle;
         }
@@ -162,119 +167,142 @@ namespace CraftPeak
         }
 
         /// <summary>
-        /// Item.Awake 직후에는 네트워크와 물리 초기화가 끝나지 않았을 수 있으므로
-        /// 다음 프레임에 다시 확인하고 제거합니다. 손이나 배낭으로 이동한 아이템은
-        /// 맵 스폰 아이템이 아니므로 제거하지 않습니다.
-        /// </summary>
-        internal void ScheduleBlockedItemDeletion(Item item)
-        {
-            if (item == null ||
-                !ShouldBlockOriginalSpawner() ||
-                !IsBlockedItem(item))
-            {
-                return;
-            }
-
-            int instanceId = item.GetInstanceID();
-
-            if (!scheduledItemInstanceIds.Add(instanceId))
-            {
-                return;
-            }
-
-            StartCoroutine(
-                DeleteGroundItemNextFrame(
-                    item,
-                    instanceId));
-        }
-
-        private IEnumerator DeleteGroundItemNextFrame(
-            Item item,
-            int instanceId)
-        {
-            yield return null;
-
-            if (item == null)
-            {
-                scheduledItemInstanceIds.Remove(instanceId);
-                yield break;
-            }
-
-            if (!ShouldBlockOriginalSpawner() ||
-                !IsBlockedItem(item) ||
-                item.itemState != ItemState.Ground)
-            {
-                scheduledItemInstanceIds.Remove(instanceId);
-                yield break;
-            }
-
-            RemoveGroundItem(item);
-        }
-
-        /// <summary>
         /// 씬 초기화 시점 차이로 남는 오브젝트를 여러 차례 정리합니다.
         /// 원본 Spawner는 Harmony Prefix에서 별도로 계속 차단됩니다.
         /// </summary>
         private IEnumerator CleanupGameplaySceneRoutine(
             int sceneHandle)
         {
+            // 씬과 Photon 오브젝트가 배치될 시간을 한 프레임 기다립니다.
             yield return null;
-            CleanupScenePass(sceneHandle, "next-frame");
 
-            yield return new WaitForSecondsRealtime(0.5f);
-            CleanupScenePass(sceneHandle, "0.5-second");
-
-            yield return new WaitForSecondsRealtime(1.5f);
-            CleanupScenePass(sceneHandle, "2-second");
-
-            yield return new WaitForSecondsRealtime(3f);
-            CleanupScenePass(sceneHandle, "5-second");
-
-            yield return new WaitForSecondsRealtime(5f);
-            CleanupScenePass(sceneHandle, "10-second");
-        }
-
-        private void CleanupScenePass(
-            int sceneHandle,
-            string passName)
-        {
-            if (!ShouldBlockOriginalSpawner() ||
-                SceneManager.GetActiveScene().handle != sceneHandle)
+            if (!IsCurrentCleanupScene(
+                    sceneHandle))
             {
-                return;
+                yield break;
             }
 
-            int removedItems = CleanupExistingGroundItems();
-            int disabledLuggage = DisableExistingLuggage();
+            CaptureInitialFieldItems();
 
-            if (removedItems > 0 || disabledLuggage > 0)
+            int removedItems =
+                RemoveCapturedInitialFieldItems();
+
+            int disabledLuggage =
+                DisableExistingLuggage();
+
+            Logger.LogInfo(
+                "Initial cleanup pass completed. " +
+                "Items=" +
+                removedItems +
+                " | Luggage=" +
+                disabledLuggage +
+                " | CapturedItemIds=" +
+                initialFieldItemInstanceIds.Count);
+
+            // 늦게 초기화되는 원본 Spawner 호출만 잠시 차단합니다.
+            // 이 시간 동안 Item.Awake 기반 삭제는 하지 않으므로
+            // 다른 모드가 직접 만든 아이템은 삭제하지 않습니다.
+            yield return
+                new WaitForSecondsRealtime(
+                    2f);
+
+            if (!IsCurrentCleanupScene(
+                    sceneHandle))
             {
-                Logger.LogInfo(
-                    "Cleanup pass=" + passName +
-                    " | Items=" + removedItems +
-                    " | Luggage=" + disabledLuggage);
+                yield break;
             }
+
+            // 첫 스냅샷에 포함된 비활성 오브젝트가 뒤늦게 활성화된 경우만 재정리합니다.
+            int lateRemoved =
+                RemoveCapturedInitialFieldItems();
+
+            initialCleanupActive =
+                false;
+
+            initialFieldItemInstanceIds.Clear();
+
+            Logger.LogInfo(
+                "Initial field cleanup finished. " +
+                "LateRemoved=" +
+                lateRemoved +
+                " | Original spawner block released=True. " +
+                "All subsequently crafted or spawned items will be preserved.");
         }
 
-        private int CleanupExistingGroundItems()
+        private bool IsCurrentCleanupScene(
+            int sceneHandle)
         {
-            int removedCount = 0;
+            return initialCleanupActive &&
+                   loadedSceneHandle ==
+                       sceneHandle &&
+                   SceneManager.GetActiveScene()
+                       .handle ==
+                       sceneHandle;
+        }
 
+        private void CaptureInitialFieldItems()
+        {
             Item[] items =
-                UnityEngine.Object.FindObjectsOfType<Item>(true);
+                UnityEngine.Object.FindObjectsByType<Item>(
+                    FindObjectsInactive.Include,
+                    FindObjectsSortMode.None);
 
-            for (int i = 0; i < items.Length; i++)
+            for (int i = 0;
+                 i < items.Length;
+                 i++)
             {
-                Item item = items[i];
+                Item item =
+                    items[i];
 
                 if (item == null ||
-                    !IsBlockedItem(item) ||
-                    item.itemState != ItemState.Ground)
+                    !IsBlockedItem(
+                        item) ||
+                    item.itemState !=
+                        ItemState.Ground)
                 {
                     continue;
                 }
 
-                RemoveGroundItem(item);
+                initialFieldItemInstanceIds.Add(
+                    item.GetInstanceID());
+            }
+
+            Logger.LogInfo(
+                "Initial field item snapshot captured. Count=" +
+                initialFieldItemInstanceIds.Count);
+        }
+
+        private int RemoveCapturedInitialFieldItems()
+        {
+            int removedCount =
+                0;
+
+            Item[] items =
+                UnityEngine.Object.FindObjectsByType<Item>(
+                    FindObjectsInactive.Include,
+                    FindObjectsSortMode.None);
+
+            for (int i = 0;
+                 i < items.Length;
+                 i++)
+            {
+                Item item =
+                    items[i];
+
+                if (item == null ||
+                    !initialFieldItemInstanceIds.Contains(
+                        item.GetInstanceID()) ||
+                    !IsBlockedItem(
+                        item) ||
+                    item.itemState !=
+                        ItemState.Ground)
+                {
+                    continue;
+                }
+
+                RemoveGroundItem(
+                    item);
+
                 removedCount++;
             }
 
@@ -314,7 +342,6 @@ namespace CraftPeak
                 return;
             }
 
-            int instanceId = item.GetInstanceID();
             string objectName = item.gameObject.name;
             ushort itemId = item.itemID;
 
@@ -350,13 +377,12 @@ namespace CraftPeak
                 UnityEngine.Object.Destroy(item.gameObject);
             }
 
-            scheduledItemInstanceIds.Remove(instanceId);
         }
 
         /// <summary>
-        /// MapHandler가 호출하는 모든 원본 Spawner를 가장 앞에서 차단합니다.
-        /// BerryBush, BerryVine, GroundPlaceSpawner, Luggage 등은
-        /// Spawner.TrySpawnItems를 통해 진입하므로 여기서 생성되지 않습니다.
+        /// 초기 필드 정리 중에만 원본 Spawner를 차단합니다.
+        /// 초기 정리가 끝나면 Prefix가 원본 실행을 허용하므로
+        /// 이후 제작·모드 스폰·게임 내 신규 스폰 아이템은 유지됩니다.
         /// </summary>
         [HarmonyPatch(
             typeof(Spawner),
@@ -379,8 +405,8 @@ namespace CraftPeak
         }
 
         /// <summary>
-        /// Luggage.OpenLuggageRPC는 TrySpawnItems를 거치지 않고
-        /// SpawnItems를 직접 호출하므로 이 경로도 차단합니다.
+        /// 초기 필드 정리 중 Luggage.OpenLuggageRPC가 직접 호출하는
+        /// SpawnItems 경로만 잠시 차단합니다.
         /// RespawnChest의 부활 로직은 RespawnChest.SpawnItems 오버라이드에서
         /// 먼저 처리되므로 유지됩니다. 아이템을 꺼내는 base.SpawnItems만 막힙니다.
         /// </summary>
@@ -426,26 +452,5 @@ namespace CraftPeak
             }
         }
 
-        /// <summary>
-        /// Spawner가 아닌 경로 또는 다른 모드에서 뒤늦게 생성된 지상 아이템도
-        /// 확인된 itemID라면 보조 차단합니다. 이후 Craft 전용 자원을 추가할 때는
-        /// Spawn.cs에 등록된 판매용 자원 itemID는 자동으로 제외됩니다.
-        /// </summary>
-        [HarmonyPatch(
-            typeof(Item),
-            "Awake")]
-        private static class ItemAwakePatch
-        {
-            [HarmonyPostfix]
-            private static void Postfix(Item __instance)
-            {
-                if (Instance == null)
-                {
-                    return;
-                }
-
-                Instance.ScheduleBlockedItemDeletion(__instance);
-            }
-        }
     }
 }
