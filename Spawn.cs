@@ -1,4 +1,4 @@
-// MAP-WIDE RARITY SPAWN + MODCONFIG BUILD 1.6.1
+// MAP-WIDE RARITY SPAWN + MODCONFIG BUILD 1.6.2
 //
 // 목표
 // - 맵 전체에 판매용 자원 3000개를 공간 밀도에 맞춰 골고루 분산
@@ -51,7 +51,7 @@ namespace CraftPeak
             "Craft PEAK Map Wide Fixed Slot Spawn";
 
         public const string PluginVersion =
-            "1.6.1";
+            "1.6.2";
 
         private const int TargetSlotCount = 3000;
 
@@ -113,6 +113,11 @@ namespace CraftPeak
             2.75f,
             2.25f
         };
+
+        // 모든 간격 패스 이후에도 목표 수량이 부족하면,
+        // 이미 검증된 남은 후보를 거리 제한 없이 채웁니다.
+        // 후보가 3000개 이상인데 최소 간격 때문에 초기화 전체가 중단되는 것을 방지합니다.
+        private const bool EnableNoSpacingFinalFill = true;
 
         private const float GroundRayStartOffset = 2f;
         private const float GroundRayDistance = 120f;
@@ -958,12 +963,15 @@ namespace CraftPeak
                 TargetSlotCount)
             {
                 Logger.LogError(
-                    "Map-wide slot initialization failed: " +
-                    "slot selection returned too few points. " +
+                    "Map-wide slot initialization failed after final fallback. " +
                     "Slots=" +
                     slots.Count +
                     " | Required=" +
-                    TargetSlotCount);
+                    TargetSlotCount +
+                    " | Candidates=" +
+                    candidates.Count +
+                    ". This now indicates genuinely insufficient unique valid candidates, " +
+                    "not a spacing-selection failure.");
 
                 yield break;
             }
@@ -2016,6 +2024,86 @@ namespace CraftPeak
                             point);
                     }
                 }
+
+                Logger.LogInfo(
+                    "Global spaced slot fill completed. " +
+                    "RequestedAdditional=" +
+                    missing +
+                    " | Added=" +
+                    globalFill.Count +
+                    " | TotalSelected=" +
+                    selected.Count);
+            }
+
+            // 핵심 안전망:
+            // 후보는 충분하지만 2.25m 최소 간격 조건 때문에 목표 수량을
+            // 채우지 못한 경우, 남은 후보를 공간적으로 균형 있게 정렬한 뒤
+            // 거리 제한 없이 추가합니다.
+            if (EnableNoSpacingFinalFill &&
+                selected.Count <
+                    TargetSlotCount)
+            {
+                int beforeFinalFill =
+                    selected.Count;
+
+                int needed =
+                    TargetSlotCount -
+                    selected.Count;
+
+                List<CandidatePoint> noSpacingCandidates =
+                    new List<CandidatePoint>();
+
+                for (int i = 0;
+                     i < candidates.Count;
+                     i++)
+                {
+                    CandidatePoint candidate =
+                        candidates[i];
+
+                    if (!selectedSet.Contains(
+                            candidate))
+                    {
+                        noSpacingCandidates.Add(
+                            candidate);
+                    }
+                }
+
+                SortNoSpacingFallbackCandidates(
+                    noSpacingCandidates);
+
+                for (int i = 0;
+                     i < noSpacingCandidates.Count &&
+                     selected.Count <
+                         TargetSlotCount;
+                     i++)
+                {
+                    CandidatePoint point =
+                        noSpacingCandidates[i];
+
+                    if (selectedSet.Add(
+                            point))
+                    {
+                        selected.Add(
+                            point);
+                    }
+                }
+
+                Logger.LogWarning(
+                    "No-spacing final slot fill applied. " +
+                    "Reason=Spacing passes could not reach target " +
+                    " | Before=" +
+                    beforeFinalFill +
+                    " | Needed=" +
+                    needed +
+                    " | AvailableRemaining=" +
+                    noSpacingCandidates.Count +
+                    " | Added=" +
+                    (
+                        selected.Count -
+                        beforeFinalFill
+                    ) +
+                    " | Final=" +
+                    selected.Count);
             }
 
             if (selected.Count >
@@ -2072,6 +2160,61 @@ namespace CraftPeak
                 "m.");
 
             LogSlotDistribution();
+        }
+
+        private static void SortNoSpacingFallbackCandidates(
+            List<CandidatePoint> points)
+        {
+            if (points == null)
+            {
+                return;
+            }
+
+            // Segment → 20m coverage cell → 좌표 순으로 정렬해
+            // 최종 안전망도 한 구역에만 몰리지 않게 합니다.
+            points.Sort(
+                delegate (
+                    CandidatePoint left,
+                    CandidatePoint right)
+                {
+                    int segmentComparison =
+                        left.SegmentIndex.CompareTo(
+                            right.SegmentIndex);
+
+                    if (segmentComparison != 0)
+                    {
+                        return segmentComparison;
+                    }
+
+                    long leftCell =
+                        GetCoverageCellKey(
+                            left.Position);
+
+                    long rightCell =
+                        GetCoverageCellKey(
+                            right.Position);
+
+                    int cellComparison =
+                        leftCell.CompareTo(
+                            rightCell);
+
+                    if (cellComparison != 0)
+                    {
+                        return cellComparison;
+                    }
+
+                    int zComparison =
+                        left.Position.z.CompareTo(
+                            right.Position.z);
+
+                    if (zComparison != 0)
+                    {
+                        return zComparison;
+                    }
+
+                    return left.Position.x.CompareTo(
+                        right.Position.x);
+                });
         }
 
         private static int CompareSelectedPoints(
