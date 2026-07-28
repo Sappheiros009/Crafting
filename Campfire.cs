@@ -17,6 +17,15 @@
 // - 이미 켜진 모닥불의 요리 기능은 변경하지 않습니다.
 // - 최종 Pyre는 건드리지 않습니다.
 // - Airport, Title, Pretitle에서는 작동하지 않습니다.
+// - 제작 등급은 요구 등급 이상이면 통과합니다.
+//   Common 조건: Common/Normal/Rare/Unique/Legendary 모두 허용
+//   Normal 조건: Normal/Rare/Unique/Legendary 모두 허용
+// - Photon 예약 이벤트 코드 충돌을 제거하여 로컬 클라이언트 점화 요청을 정상 전달합니다.
+// - 점화 요청 단계별 진단 로그를 출력합니다.
+// - 현재 PEAK의 실제 Light_Rpc(bool updateSegment, float burningFor) 시그니처를 사용합니다.
+// - 호스트 검증 완료 후 Photon RPC에 true, 0f 인수를 전달합니다.
+// - updateSegment=true로 다음 구간 진행을 활성화하고 burningFor=0f로 새 점화를 시작합니다.
+// - RPC 실행 결과를 검증하고 실패 시 점화 잠금을 해제합니다.
 //
 // 중요
 // - Delete.cs가 PatchAll(typeof(Delete).Assembly)을 실행하므로
@@ -65,7 +74,7 @@ namespace CraftPeak
             "Craft PEAK Campfire Materials";
 
         public const string PluginVersion =
-            "1.1.1";
+            "1.1.5";
 
         public const ushort FireWoodItemId = 28;
         public const ushort StoneItemId = 72;
@@ -82,6 +91,17 @@ namespace CraftPeak
         private const int MaximumConfigMaterialCount = 20;
         private const float MinimumConfigDistance = 1f;
         private const float MaximumConfigDistance = 50f;
+
+        private static readonly System.Reflection.MethodInfo
+            OriginalLightRpcMethod =
+                AccessTools.Method(
+                    typeof(global::Campfire),
+                    "Light_Rpc",
+                    new Type[]
+                    {
+                        typeof(bool),
+                        typeof(float)
+                    });
 
         public static int RequiredFireWoodCount
         {
@@ -143,9 +163,11 @@ namespace CraftPeak
         private static ConfigEntry<float>
             maximumRequesterDistanceConfig;
 
-        private const byte IgniteRequestEventCode = 212;
-        private const byte IgniteResultEventCode = 213;
-        private const byte ConsumedSelectedSlotEventCode = 214;
+        // Photon custom event codes must remain below 200.
+        // 200~255는 Photon 내부 예약 범위입니다.
+        private const byte IgniteRequestEventCode = 170;
+        private const byte IgniteResultEventCode = 171;
+        private const byte ConsumedSelectedSlotEventCode = 172;
 
         private readonly HashSet<int> committedCampfireViewIds =
             new HashSet<int>();
@@ -221,6 +243,13 @@ namespace CraftPeak
 
             LogCurrentCampfireConditions(
                 "Loaded");
+
+            Logger.LogInfo(
+                "Campfire Photon event codes=" +
+                IgniteRequestEventCode +
+                "-" +
+                ConsumedSelectedSlotEventCode +
+                " (Photon-safe range)");
         }
 
         private void BindCampfireConfig()
@@ -633,6 +662,17 @@ namespace CraftPeak
                 campfireView.ViewID
             };
 
+            Logger.LogInfo(
+                "[CampfireIgnitionDiag] Request prepared. " +
+                "Actor=" +
+                requesterActorNumber +
+                " | CampfireViewID=" +
+                campfireView.ViewID +
+                " | IsMaster=" +
+                PhotonNetwork.IsMasterClient +
+                " | EventCode=" +
+                IgniteRequestEventCode);
+
             if (PhotonNetwork.IsMasterClient)
             {
                 ProcessIgniteRequestOnHost(
@@ -712,7 +752,10 @@ namespace CraftPeak
                 HandleConsumedSelectedSlots(
                     photonEvent.CustomData as
                         object[]);
+
+                return;
             }
+
         }
 
         private void ProcessIgniteRequestOnHost(
@@ -723,6 +766,17 @@ namespace CraftPeak
             {
                 return;
             }
+
+            Logger.LogInfo(
+                "[CampfireIgnitionDiag] Host received ignition request. " +
+                "Actor=" +
+                requesterActorNumber +
+                " | PayloadLength=" +
+                (
+                    requestData != null
+                        ? requestData.Length
+                        : 0
+                ));
 
             if (!IsGameplayActive())
             {
@@ -825,6 +879,15 @@ namespace CraftPeak
                 return;
             }
 
+            Logger.LogInfo(
+                "[CampfireIgnitionDiag] Campfire target validated. " +
+                "ViewID=" +
+                campfireViewId +
+                " | Lit=" +
+                campfire.Lit +
+                " | State=" +
+                campfire.state);
+
             global::Player requester =
                 PlayerHandler.GetPlayer(
                     requesterActorNumber);
@@ -863,6 +926,15 @@ namespace CraftPeak
                 return;
             }
 
+            Logger.LogInfo(
+                "[CampfireIgnitionDiag] Requester distance validated. " +
+                "Actor=" +
+                requesterActorNumber +
+                " | Distance=" +
+                requesterDistance.ToString("0.00") +
+                " | Maximum=" +
+                MaximumRequesterDistance.ToString("0.00"));
+
             if (RequireEveryoneInRange)
             {
                 string rangeMessage;
@@ -887,6 +959,13 @@ namespace CraftPeak
                 }
             }
 
+            Logger.LogInfo(
+                "[CampfireIgnitionDiag] Player range condition passed. " +
+                "RequireEveryone=" +
+                RequireEveryoneInRange +
+                " | EveryoneRange=" +
+                EveryoneInRangeDistance.ToString("0.00"));
+
             IngredientPlan plan;
             string missingMessage;
 
@@ -910,6 +989,10 @@ namespace CraftPeak
 
                 return;
             }
+
+            Logger.LogInfo(
+                "[CampfireIgnitionDiag] Material condition passed. " +
+                BuildMaterialCountLog());
 
             committedCampfireViewIds.Add(
                 campfireViewId);
@@ -938,30 +1021,145 @@ namespace CraftPeak
             BroadcastConsumedSelectedSlots(
                 consumedSelectedSlots);
 
-            campfireView.RPC(
-                "Light_Rpc",
-                RpcTarget.All,
-                Array.Empty<object>());
-
-            SendIgniteResult(
-                requesterActorNumber,
-                true,
-                "모닥불 점화 성공\n" +
-                BuildConsumedMaterialMessage());
-
             Logger.LogInfo(
-                "Campfire ignition approved by host. " +
+                "[CampfireIgnitionDiag] All conditions passed. " +
+                "Calling Light_Rpc(true, 0f). " +
                 "Actor=" +
                 requesterActorNumber +
                 " | CampfireViewID=" +
                 campfireViewId +
-                " | Consumed: FireWood=" +
-                RequiredFireWoodCount +
-                ", Stone=" +
-                RequiredStoneCount +
-                ", Torch=" +
-                RequiredTorchCount +
-                ".");
+                " | BeforeLit=" +
+                campfire.Lit +
+                " | BeforeState=" +
+                campfire.state);
+
+            try
+            {
+                campfireView.RPC(
+                    "Light_Rpc",
+                    RpcTarget.All,
+                    true,
+                    0f);
+            }
+            catch (Exception exception)
+            {
+                committedCampfireViewIds.Remove(
+                    campfireViewId);
+
+                Logger.LogError(
+                    "[CampfireIgnitionDiag] Photon Light_Rpc(true, 0f) threw an exception. " +
+                    "CampfireViewID=" +
+                    campfireViewId +
+                    " | Exception=" +
+                    exception);
+
+                SendIgniteResult(
+                    requesterActorNumber,
+                    false,
+                    "모닥불 점화 RPC 호출 중 예외가 발생했습니다. " +
+                    "점화 잠금을 해제했습니다.");
+
+                return;
+            }
+
+            StartCoroutine(
+                VerifyCorrectArgumentRpcResult(
+                    requesterActorNumber,
+                    campfireViewId,
+                    campfire));
+        }
+
+        private System.Collections.IEnumerator
+            VerifyCorrectArgumentRpcResult(
+                int requesterActorNumber,
+                int campfireViewId,
+                global::Campfire campfire)
+        {
+            yield return
+                new WaitForSecondsRealtime(
+                    0.25f);
+
+            bool succeeded =
+                IsCampfireActuallyLit(
+                    campfire);
+
+            Logger.LogInfo(
+                "[CampfireIgnitionDiag] Light_Rpc(true, 0f) verification. " +
+                "Actor=" +
+                requesterActorNumber +
+                " | CampfireViewID=" +
+                campfireViewId +
+                " | Lit=" +
+                (
+                    campfire != null &&
+                    campfire.Lit
+                ) +
+                " | State=" +
+                (
+                    campfire != null
+                        ? campfire.state.ToString()
+                        : "<destroyed>"
+                ) +
+                " | Success=" +
+                succeeded);
+
+            if (succeeded)
+            {
+                SendIgniteResult(
+                    requesterActorNumber,
+                    true,
+                    "모닥불 점화 성공\n" +
+                    BuildConsumedMaterialMessage());
+
+                Logger.LogInfo(
+                    "Campfire ignition verified with correct RPC arguments. " +
+                    "Actor=" +
+                    requesterActorNumber +
+                    " | CampfireViewID=" +
+                    campfireViewId +
+                    " | updateSegment=True" +
+                    " | burningFor=0" +
+                    " | Consumed: FireWood=" +
+                    RequiredFireWoodCount +
+                    ", Stone=" +
+                    RequiredStoneCount +
+                    ", Torch=" +
+                    RequiredTorchCount +
+                    ".");
+
+                yield break;
+            }
+
+            committedCampfireViewIds.Remove(
+                campfireViewId);
+
+            SendIgniteResult(
+                requesterActorNumber,
+                false,
+                "Light_Rpc(true, 0f)를 호출했지만 모닥불 상태가 변경되지 않았습니다. " +
+                "점화 잠금을 해제했습니다.");
+
+            Logger.LogError(
+                "[CampfireIgnitionDiag] Correct-argument Light_Rpc did not activate campfire. " +
+                "Actor=" +
+                requesterActorNumber +
+                " | CampfireViewID=" +
+                campfireViewId +
+                " | LockReleased=True");
+        }
+
+        private static bool IsCampfireActuallyLit(
+            global::Campfire campfire)
+        {
+            if (campfire == null)
+            {
+                return false;
+            }
+
+            return
+                campfire.Lit ||
+                campfire.state !=
+                    global::Campfire.FireState.Off;
         }
 
         private static bool TryCreateIngredientPlan(
@@ -1982,6 +2180,17 @@ namespace CraftPeak
 
             NotifyLocalPlayer(
                 message);
+
+            if (ModLogger != null)
+            {
+                ModLogger.LogInfo(
+                    "[CampfireIgnitionDiag] Result received. Success=" +
+                    success +
+                    " | Message=" +
+                    message.Replace(
+                        "\n",
+                        " | "));
+            }
 
             if (ModLogger != null)
             {
