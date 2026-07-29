@@ -85,7 +85,7 @@ namespace CraftPeak
             "Craft PEAK Unified Hub";
 
         public const string PluginVersion =
-            "2.11.6";
+            "2.11.7";
 
         public const string DeveloperName =
             "Sapphire009";
@@ -7737,15 +7737,16 @@ namespace CraftPeak
                 return;
             }
 
+            // InventoryStack.GetStackCount(ItemSlot)은 일반 인벤토리 슬롯과
+            // 배낭 내부 슬롯을 모두 판별합니다. 배낭 슬롯은 대표 ItemSlot 1개만
+            // 존재하므로 Player+slotId 방식이 아니라 실제 ItemSlot 기준으로
+            // 저장된 xN 수량을 읽어야 합니다.
             int amount =
-                stackAware
-                    ? Mathf.Max(
-                        1,
-                        InventoryStack
-                            .GetStackCount(
-                                player,
-                                slotId))
-                    : 1;
+                Mathf.Max(
+                    1,
+                    InventoryStack
+                        .GetStackCount(
+                            slot));
 
             int current;
 
@@ -7892,7 +7893,12 @@ namespace CraftPeak
                         slot.prefab.itemID ==
                             itemId)
                     {
-                        count++;
+                        count +=
+                            Mathf.Max(
+                                1,
+                                InventoryStack
+                                    .GetStackCount(
+                                        slot));
                     }
                 }
             }
