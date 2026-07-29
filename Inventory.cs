@@ -37,6 +37,8 @@
 // - Q 드롭은 기존대로 x3→x2처럼 정확히 1개만 감소합니다.
 // - 배낭 수량은 실제 BackpackData 객체와 내부 슬롯 번호로도 보존해 회수 시 xN을 확실히 복원합니다.
 // - 기존 인벤토리 x1 + 배낭 x2는 회수 후 x3, 기존 x1 + 배낭 x50은 x51이 됩니다.
+// - 배낭 아이템을 기존 스택에 회수할 때 Player.AddItem의 null 반환 슬롯을 사용하지 않고
+//   RequestPickup 단계에서 기존 수량과 배낭 전체 수량을 직접 합산합니다.
 //
 // 스택 대상
 // - 판매용 자원 11종: Spawn.IsSaleResourceId(itemID)
@@ -98,7 +100,7 @@ namespace CraftPeak
             "Craft PEAK Inventory Stack";
 
         public const string PluginVersion =
-            "1.6.7";
+            "1.6.9";
 
         private const int DefaultMaximumStackCount = 10;
         private const int MinimumConfigStackCount = 1;
@@ -4087,6 +4089,139 @@ namespace CraftPeak
             return state;
         }
 
+        internal bool TryHandleBackpackWithdrawalIntoExistingStack(
+            Item backpackItem,
+            PhotonView characterView,
+            BackpackWithdrawalState state)
+        {
+            if (!PhotonNetwork.IsMasterClient ||
+                !state.IsValid ||
+                backpackItem == null ||
+                characterView == null)
+            {
+                return false;
+            }
+
+            Character character =
+                characterView.GetComponent<Character>();
+
+            global::Player player =
+                character != null
+                    ? character.player
+                    : null;
+
+            if (player == null ||
+                player.photonView == null ||
+                player.photonView.Owner == null ||
+                player.photonView.Owner.ActorNumber !=
+                    state.ActorNumber ||
+                character.refs == null ||
+                character.refs.view == null)
+            {
+                return false;
+            }
+
+            ItemSlot targetSlot;
+
+            if (!TryFindStackWithSpace(
+                    player,
+                    state.ItemId,
+                    out targetSlot) ||
+                targetSlot == null ||
+                targetSlot.IsEmpty() ||
+                targetSlot.prefab == null ||
+                targetSlot.prefab.itemID !=
+                    state.ItemId)
+            {
+                return false;
+            }
+
+            int currentCount =
+                Mathf.Max(
+                    1,
+                    GetCountInternal(
+                        player,
+                        targetSlot.itemSlotID));
+
+            int combinedCount =
+                currentCount +
+                state.Count;
+
+            // 기존 스택과 배낭 전체 수량이 현재 최대 적재량 안에 들어가는
+            // 경우에만 이 직접 병합 경로를 사용합니다.
+            // 들어가지 않으면 원본 RequestPickup 경로가 새 슬롯을 선택할
+            // 가능성을 유지합니다.
+            if (combinedCount >
+                MaximumStackCount)
+            {
+                return false;
+            }
+
+            SetCountOnHost(
+                player,
+                targetSlot.itemSlotID,
+                combinedCount,
+                "BackpackWithdrawalDirectExistingStackMerge");
+
+            // Player.AddItem을 호출하지 않고 원본 RequestPickup의
+            // 배낭 정리 및 획득 승인 부분만 그대로 수행합니다.
+            // 이렇게 하면 HarmonyX가 out ItemSlot을 null로 남기는 경우에도
+            // itemSlot.itemSlotID NullReferenceException이 발생하지 않습니다.
+            backpackItem.ClearDataFromBackpack();
+
+            RemoveBackpackCountOnHost(
+                player,
+                state.BackpackSlotIndex,
+                "BackpackWithdrawalDirectExistingStackCompleted");
+
+            RemoveActualBackpackDataCount(
+                state.ActualBackpackData,
+                state.BackpackSlotIndex,
+                state.Guid);
+
+            NotifyInventoryChanged(
+                player);
+
+            SyncPlayerInventoryFromHost(
+                player);
+
+            character.refs.view.RPC(
+                "OnPickupAccepted",
+                player.photonView.Owner,
+                new object[]
+                {
+                    targetSlot.itemSlotID
+                });
+
+            if (ModLogger != null)
+            {
+                ModLogger.LogInfo(
+                    "Backpack withdrawal merged directly into existing stack. " +
+                    GetPlayerLogName(
+                        player) +
+                    " | BackpackSlot=" +
+                    state.BackpackSlotIndex +
+                    " | InventorySlot=" +
+                    targetSlot.itemSlotID +
+                    " | ItemID=" +
+                    state.ItemId +
+                    " | ExistingCount=" +
+                    currentCount +
+                    " | BackpackCount=" +
+                    state.Count +
+                    " | Formula=" +
+                    currentCount +
+                    "+" +
+                    state.Count +
+                    " | Count=" +
+                    combinedCount +
+                    " | Guid=" +
+                    state.Guid);
+            }
+
+            return true;
+        }
+
         internal void CompleteBackpackWithdrawal(
             PhotonView characterView,
             BackpackWithdrawalState state)
@@ -5412,9 +5547,14 @@ namespace CraftPeak
             global::Player __instance,
             ushort itemID,
             ItemInstanceData instanceData,
-            ref ItemSlot slot,
+            ref ItemSlot __2,
             ref bool __result)
         {
+            // Player.AddItem의 세 번째 out ItemSlot 인수는 원본 메서드의
+            // 실제 매개변수 이름과 무관하게 Harmony 위치 인수 __2로 연결합니다.
+            // 기존 스택 병합 시 반환 슬롯이 null로 남으면 RequestPickup Postfix가
+            // 중단되어 배낭의 나머지 수량을 복원하지 못하므로 반드시 __2를 사용합니다.
+
             // 같은 어셈블리에 진단 플러그인이 PatchAll을 다시 실행해
             // 이 Prefix가 중복 등록된 경우에도 한 AddItem 호출을 한 번만 처리합니다.
             if (InventoryStack.AddItemMergePrefixInProgress)
@@ -5454,7 +5594,7 @@ namespace CraftPeak
                     return true;
                 }
 
-                slot =
+                __2 =
                     mergedSlot;
 
                 __result =
@@ -5487,7 +5627,7 @@ namespace CraftPeak
 
             // 로컬 수집 코드는 즉시 성공으로 끝내고,
             // 실제 권한 수량은 호스트가 요청을 받아 증가시킵니다.
-            slot =
+            __2 =
                 mergedSlot;
 
             __result =
@@ -5501,7 +5641,7 @@ namespace CraftPeak
             global::Player __instance,
             ushort itemID,
             ItemInstanceData instanceData,
-            ItemSlot slot,
+            ItemSlot __2,
             bool __result)
         {
             InventoryStack.AddItemMergePrefixInProgress =
@@ -5516,7 +5656,7 @@ namespace CraftPeak
                 !InventoryStack
                     .IsStackableItemId(
                         itemID) ||
-                slot == null)
+                __2 == null)
             {
                 return;
             }
@@ -5526,7 +5666,7 @@ namespace CraftPeak
             int count =
                 InventoryStack.GetStackCount(
                     __instance,
-                    slot.itemSlotID);
+                    __2.itemSlotID);
 
             if (count > 1)
             {
@@ -5536,7 +5676,7 @@ namespace CraftPeak
             InventoryStack.Instance
                 .HostRegisterNewSlot(
                     __instance,
-                    slot,
+                    __2,
                     itemID);
 
         }
@@ -5634,7 +5774,7 @@ namespace CraftPeak
         private static void Postfix(
             global::Player __instance,
             ushort itemID,
-            ItemSlot slot,
+            ItemSlot __2,
             bool __result)
         {
             if (InventoryStack.Instance == null)
@@ -5650,7 +5790,7 @@ namespace CraftPeak
                 __result +
                 " | ReturnedSlot=" +
                 InventoryStack.BuildItemSlotDiagnostic(
-                    slot) +
+                    __2) +
                 " | " +
                 InventoryStack.BuildHandStateSummary(
                     __instance,
@@ -6266,7 +6406,7 @@ namespace CraftPeak
     {
         [HarmonyPrefix]
         [HarmonyPriority(Priority.First)]
-        private static void Prefix(
+        private static bool Prefix(
             Item __instance,
             PhotonView characterView,
             out InventoryStack.BackpackWithdrawalState __state)
@@ -6279,6 +6419,32 @@ namespace CraftPeak
                             characterView)
                     : default(
                         InventoryStack.BackpackWithdrawalState);
+
+            if (InventoryStack.Instance == null ||
+                !__state.IsValid)
+            {
+                return true;
+            }
+
+            bool handledDirectly =
+                InventoryStack.Instance
+                    .TryHandleBackpackWithdrawalIntoExistingStack(
+                        __instance,
+                        characterView,
+                        __state);
+
+            if (!handledDirectly)
+            {
+                return true;
+            }
+
+            // 원본 RequestPickup을 건너뛰었으므로 Postfix의 일반 복원 경로가
+            // 다시 실행되지 않도록 상태를 비웁니다.
+            __state =
+                default(
+                    InventoryStack.BackpackWithdrawalState);
+
+            return false;
         }
 
         [HarmonyPostfix]
