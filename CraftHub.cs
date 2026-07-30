@@ -1,4 +1,4 @@
-// CRAFT PEAK UNIFIED HUB - PROGRESSION ON-DEMAND BUILD 2.2.3
+// CRAFT PEAK UNIFIED HUB - PROGRESSION ON-DEMAND BUILD 2.12.0
 //
 // Developer: Sapphire009
 // Project: Craft PEAK
@@ -18,8 +18,8 @@
 // 포함 기능
 // - 공유 돈 초기화/동기화
 // - 인벤토리 슬롯 클릭 판매와 호스트 검증
-// - 전체 비자원 아이템 제작식, 파티 재료 소비, 제작 성공/실패
-// - 자원 등급, 채집 속도, 적재량, 모닥불 효율, 수집량 x2~x5 강화
+// - 전체 비자원 아이템 제작식, 파티 재료 소비와 완성품 지급
+// - 자원 등급, 적재량, 모닥불 효율, 수집량 x2~x5 강화
 // - 강화 상태 Photon Room Property 저장 및 호스트 승계
 // - P키 통합 UI
 // - 비행기 부품 구매와 세그먼트별 모닥불 진행 조건
@@ -39,6 +39,7 @@
 // - FindAnyObjectByType / Resources.FindObjectsOfTypeAll 반복 검색을 제거했습니다.
 // - UI 텍스트와 활성 상태가 실제로 바뀔 때만 Canvas를 더럽힙니다.
 //
+// 판매용 자원은 PEAK 원본 Item 상호작용을 사용하므로 E키 입력 즉시 획득합니다.
 // Delete.cs가 같은 어셈블리를 PatchAll하므로 별도의 Harmony.PatchAll 호출은 없습니다.
 // 리플렉션을 사용하지 않습니다.
 
@@ -67,7 +68,6 @@ namespace CraftPeak
     [BepInPlugin(PluginGuid, PluginName, PluginVersion)]
     [BepInDependency(Delete.PluginGuid, BepInDependency.DependencyFlags.HardDependency)]
     [BepInDependency(Spawn.PluginGuid, BepInDependency.DependencyFlags.HardDependency)]
-    [BepInDependency(LongE.PluginGuid, BepInDependency.DependencyFlags.HardDependency)]
     [BepInDependency(CampfireGate.PluginGuid, BepInDependency.DependencyFlags.HardDependency)]
     [BepInDependency(InventoryStack.PluginGuid, BepInDependency.DependencyFlags.HardDependency)]
     [BepInDependency(
@@ -85,7 +85,7 @@ namespace CraftPeak
             "Craft PEAK Unified Hub";
 
         public const string PluginVersion =
-            "2.11.7";
+            "2.12.5";
 
         public const string DeveloperName =
             "Sapphire009";
@@ -168,9 +168,6 @@ namespace CraftPeak
         private const string UpgradeResourceKey =
             "CraftPeak.Upgrade.Resource";
 
-        private const string UpgradeGatherKey =
-            "CraftPeak.Upgrade.Gather";
-
         private const string UpgradeStackKey =
             "CraftPeak.Upgrade.Stack";
 
@@ -183,9 +180,6 @@ namespace CraftPeak
         private const string UpgradeSellMultiplierKey =
             "CraftPeak.Upgrade.SellMultiplier";
 
-        private const string UpgradeBaseHoldKey =
-            "CraftPeak.Upgrade.BaseHold";
-
         private const string UpgradeBaseStackKey =
             "CraftPeak.Upgrade.BaseStack";
 
@@ -195,23 +189,16 @@ namespace CraftPeak
         private const int UpgradeProtocolVersion = 1;
 
         private const int ResourceUpgradeMaximum = 4;
-        private const int GatherUpgradeMaximum = 4;
         private const int StackUpgradeMaximum = 4;
+
+        private const int DefaultBaseStackCount =
+            10;
         private const int CampfireUpgradeMaximum = 4;
         private const int YieldUpgradeMaximum = 4;
         private const int SellValueUpgradeMaximum = 4;
 
         private const double MinimumRequestIntervalSeconds = 0.25d;
         private const float PartyResourceCacheSeconds = 1.00f;
-
-        private static readonly float[] GatherTimeFactors =
-        {
-            1f,
-            0.80f,
-            0.65f,
-            0.50f,
-            0.35f
-        };
 
         private static readonly int[] StackCapacityBonuses =
         {
@@ -409,6 +396,7 @@ namespace CraftPeak
             CraftUiCategory.Climbing;
 
         private int selectedSellSlotId = -1;
+        private int selectedSellQuantity = 1;
         private int selectedPartIndex;
 
         private PendingRequest pendingRequest =
@@ -451,22 +439,12 @@ namespace CraftPeak
         private string lastAppliedUpgradeRunId =
             string.Empty;
 
-        private ConfigEntry<bool>
-            failureEnabledConfig;
-
-        private ConfigEntry<bool>
-            consumeCostOnFailureConfig;
-
         private UpgradeFormulaConfig resourceUpgradeFormula;
-        private UpgradeFormulaConfig gatherUpgradeFormula;
         private UpgradeFormulaConfig stackUpgradeFormula;
         private UpgradeFormulaConfig campfireUpgradeFormula;
 
         private ConfigEntry<int>
             doubleYieldCostConfig;
-
-        private ConfigEntry<float>
-            doubleYieldChanceConfig;
 
         private UpgradeFormulaConfig
             sellValueUpgradeFormula;
@@ -577,7 +555,6 @@ namespace CraftPeak
             public int RequiredResourceLevel;
 
             public int MoneyCost;
-            public float SuccessChance;
 
             public readonly List<IngredientCost>
                 Ingredients =
@@ -590,7 +567,6 @@ namespace CraftPeak
             public string Name;
             public int RequiredResourceLevel;
             public int MoneyCost;
-            public float SuccessChance;
             public readonly List<IngredientCost> Ingredients =
                 new List<IngredientCost>();
 
@@ -599,7 +575,6 @@ namespace CraftPeak
                 string name,
                 int requiredResourceLevel,
                 int moneyCost,
-                float successChance,
                 params IngredientCost[] ingredients)
             {
                 Stage = Mathf.Clamp(stage, 1, 4);
@@ -607,8 +582,6 @@ namespace CraftPeak
                 RequiredResourceLevel =
                     Mathf.Clamp(requiredResourceLevel, 0, 4);
                 MoneyCost = Mathf.Max(0, moneyCost);
-                SuccessChance =
-                    Mathf.Clamp(successChance, 1f, 100f);
 
                 if (ingredients != null)
                 {
@@ -652,19 +625,16 @@ namespace CraftPeak
         internal enum UpgradeKind
         {
             ResourceGrade = 0,
-            GatherSpeed = 1,
-            StackCapacity = 2,
-            CampfireEfficiency = 3,
-            DoubleYield = 4,
-            SellValue = 5
+            StackCapacity = 1,
+            CampfireEfficiency = 2,
+            DoubleYield = 3,
+            SellValue = 4
         }
 
         private sealed class UpgradeFormulaConfig
         {
             public ConfigEntry<int> BaseCost;
             public ConfigEntry<int> CostGrowth;
-            public ConfigEntry<float> StartChance;
-            public ConfigEntry<float> ChanceLoss;
         }
 
         private sealed class UpgradeState
@@ -675,13 +645,11 @@ namespace CraftPeak
             public string RunId;
 
             public int ResourceLevel;
-            public int GatherLevel;
             public int StackLevel;
             public int CampfireLevel;
             public int YieldMultiplier;
             public int SellMultiplier;
 
-            public float BaseHoldSeconds;
             public int BaseStackCount;
             public int[] BaseCampfireMaterials;
 
@@ -706,9 +674,6 @@ namespace CraftPeak
                         ResourceLevel =
                             ResourceLevel,
 
-                        GatherLevel =
-                            GatherLevel,
-
                         StackLevel =
                             StackLevel,
 
@@ -720,9 +685,6 @@ namespace CraftPeak
 
                         SellMultiplier =
                             SellMultiplier,
-
-                        BaseHoldSeconds =
-                            BaseHoldSeconds,
 
                         BaseStackCount =
                             BaseStackCount,
@@ -753,9 +715,6 @@ namespace CraftPeak
                         ResourceLevel =
                             0,
 
-                        GatherLevel =
-                            0,
-
                         StackLevel =
                             0,
 
@@ -767,9 +726,6 @@ namespace CraftPeak
 
                         SellMultiplier =
                             1,
-
-                        BaseHoldSeconds =
-                            10f,
 
                         BaseStackCount =
                             10,
@@ -860,18 +816,6 @@ namespace CraftPeak
                     Instance != null
                         ? Instance.upgradeState
                             .ResourceLevel
-                        : 0;
-            }
-        }
-
-        public static int GatherUpgradeLevel
-        {
-            get
-            {
-                return
-                    Instance != null
-                        ? Instance.upgradeState
-                            .GatherLevel
                         : 0;
             }
         }
@@ -997,6 +941,7 @@ namespace CraftPeak
             // 돈, 제작식, 파티 인벤토리, 강화, 부품 데이터는
             // P 메뉴를 여는 순간 또는 실제 네트워크 이벤트가 발생했을 때만 읽습니다.
             UpdatePendingRequest();
+            UpdateSellQuantityInput();
 
             if (activeWindow != null &&
                 !activeWindow.isOpen)
@@ -1024,6 +969,124 @@ namespace CraftPeak
             {
                 OpenHub();
             }
+        }
+
+        private void UpdateSellQuantityInput()
+        {
+            if (activeWindow == null ||
+                currentTab != HubTab.Sell ||
+                pendingRequest != PendingRequest.None)
+            {
+                return;
+            }
+
+            Mouse mouse =
+                Mouse.current;
+
+            if (mouse == null)
+            {
+                return;
+            }
+
+            float scrollY =
+                mouse.scroll
+                    .ReadValue()
+                    .y;
+
+            if (Mathf.Abs(scrollY) <
+                0.01f)
+            {
+                return;
+            }
+
+            int step =
+                1;
+
+            Keyboard keyboard =
+                Keyboard.current;
+
+            if (keyboard != null &&
+                (
+                    keyboard.leftShiftKey
+                        .isPressed ||
+                    keyboard.rightShiftKey
+                        .isPressed
+                ))
+            {
+                step =
+                    5;
+            }
+
+            AdjustSelectedSellQuantity(
+                scrollY >
+                    0f
+                    ? step
+                    : -step);
+        }
+
+        private void AdjustSelectedSellQuantity(
+            int delta)
+        {
+            global::Player player =
+                global::Player.localPlayer;
+
+            if (player == null ||
+                player.itemSlots == null ||
+                selectedSellSlotId < 0 ||
+                selectedSellSlotId >=
+                    player.itemSlots.Length)
+            {
+                selectedSellQuantity =
+                    1;
+
+                return;
+            }
+
+            ItemSlot slot =
+                player.GetItemSlot(
+                    (byte)selectedSellSlotId);
+
+            if (slot == null ||
+                slot.IsEmpty() ||
+                slot.prefab == null ||
+                !Spawn.IsSaleResourceId(
+                    slot.prefab.itemID))
+            {
+                selectedSellQuantity =
+                    1;
+
+                return;
+            }
+
+            int count =
+                Mathf.Max(
+                    1,
+                    InventoryStack
+                        .GetStackCount(
+                            player,
+                            (byte)selectedSellSlotId));
+
+            int nextQuantity =
+                Mathf.Clamp(
+                    selectedSellQuantity +
+                    delta,
+                    1,
+                    count);
+
+            if (nextQuantity ==
+                selectedSellQuantity)
+            {
+                return;
+            }
+
+            selectedSellQuantity =
+                nextQuantity;
+
+            SetTabStatus(
+                HubTab.Sell,
+                "판매 수량을 " +
+                selectedSellQuantity +
+                "개로 설정했습니다.");
         }
 
         private void HandleSceneLoaded(
@@ -1060,6 +1123,9 @@ namespace CraftPeak
 
             selectedSellSlotId =
                 -1;
+
+            selectedSellQuantity =
+                1;
 
             craftPage =
                 0;
@@ -1880,6 +1946,12 @@ namespace CraftPeak
                     0,
                     balance);
 
+            if (success)
+            {
+                selectedSellQuantity =
+                    1;
+            }
+
             // 아이템은 판매 확정 전에 클라이언트 제거 단계에서 이미 소모됩니다.
             SetTabStatus(
                 HubTab.Sell,
@@ -1936,7 +2008,7 @@ namespace CraftPeak
                             ? "제작에 성공했습니다."
                             : (
                                 materialsConsumed
-                                    ? "제작에 실패했습니다."
+                                    ? "제작품 지급 중 오류가 발생했습니다."
                                     : "제작 요청이 거부되었습니다."
                             );
                 }
@@ -3196,7 +3268,6 @@ namespace CraftPeak
                 "첫 번째 다음 모닥불",
                 0,
                 30,
-                84f,
                 seed + 101,
                 new PoolRequest(commonSale, 2),
                 new PoolRequest(commonUtility, 1),
@@ -3207,7 +3278,6 @@ namespace CraftPeak
                 "두 번째 다음 모닥불",
                 1,
                 110,
-                63f,
                 seed + 202,
                 new PoolRequest(normalSale, 2),
                 new PoolRequest(normalUtility, 1),
@@ -3221,7 +3291,6 @@ namespace CraftPeak
                 "세 번째 다음 모닥불",
                 2,
                 275,
-                39f,
                 seed + 303,
                 new PoolRequest(rareSale, 1),
                 new PoolRequest(rareUtility, 1),
@@ -3233,7 +3302,6 @@ namespace CraftPeak
                 "네 번째 다음 모닥불",
                 3,
                 600,
-                21f,
                 seed + 404,
                 new PoolRequest(uniqueSale, 1),
                 new PoolRequest(uniqueUtility, 1),
@@ -3321,7 +3389,6 @@ namespace CraftPeak
             string name,
             int requiredResourceLevel,
             int moneyCost,
-            float successChance,
             int seed,
             params PoolRequest[] requests)
         {
@@ -3336,7 +3403,6 @@ namespace CraftPeak
                     name,
                     requiredResourceLevel,
                     moneyCost,
-                    successChance,
                     ingredients.ToArray()));
         }
 
@@ -5212,7 +5278,6 @@ namespace CraftPeak
                 0,
                 4,
                 9,
-                88f,
                 commonSale,
                 null,
                 commonOutputs,
@@ -5230,7 +5295,6 @@ namespace CraftPeak
                 0,
                 7,
                 13,
-                84f,
                 commonSale,
                 commonOutputs,
                 commonOutputs,
@@ -5247,7 +5311,6 @@ namespace CraftPeak
                 0,
                 5,
                 11,
-                86f,
                 commonSale,
                 commonOutputs,
                 commonOutputs,
@@ -5264,7 +5327,6 @@ namespace CraftPeak
                 0,
                 8,
                 8,
-                90f,
                 commonSale,
                 null,
                 commonOutputs,
@@ -5277,7 +5339,6 @@ namespace CraftPeak
                 1,
                 14,
                 25,
-                68f,
                 MergePools(commonSale, normalSale),
                 commonOutputs,
                 normalOutputs,
@@ -5302,7 +5363,6 @@ namespace CraftPeak
                 1,
                 22,
                 34,
-                61f,
                 normalSale,
                 commonOutputs,
                 normalOutputs,
@@ -5319,7 +5379,6 @@ namespace CraftPeak
                 1,
                 18,
                 29,
-                64f,
                 normalSale,
                 commonOutputs,
                 normalOutputs,
@@ -5336,7 +5395,6 @@ namespace CraftPeak
                 1,
                 28,
                 28,
-                66f,
                 normalSale,
                 commonOutputs,
                 normalOutputs,
@@ -5349,7 +5407,6 @@ namespace CraftPeak
                 2,
                 42,
                 64,
-                43f,
                 rareSale,
                 normalOutputs,
                 rareOutputs,
@@ -5367,7 +5424,6 @@ namespace CraftPeak
                 2,
                 58,
                 78,
-                37f,
                 rareSale,
                 normalOutputs,
                 rareOutputs,
@@ -5386,7 +5442,6 @@ namespace CraftPeak
                 3,
                 90,
                 130,
-                27f,
                 MergePools(rareSale, uniqueSale),
                 rareOutputs,
                 uniqueOutputs,
@@ -5401,7 +5456,6 @@ namespace CraftPeak
                 3,
                 120,
                 170,
-                23f,
                 MergePools(rareSale, uniqueSale),
                 normalOutputs,
                 uniqueOutputs,
@@ -5418,7 +5472,6 @@ namespace CraftPeak
                 3,
                 115,
                 160,
-                24f,
                 MergePools(rareSale, uniqueSale),
                 rareOutputs,
                 uniqueOutputs,
@@ -5433,7 +5486,6 @@ namespace CraftPeak
                 4,
                 230,
                 330,
-                14f,
                 legendarySale,
                 uniqueOutputs,
                 null,
@@ -5449,7 +5501,6 @@ namespace CraftPeak
                 4,
                 240,
                 340,
-                13f,
                 legendarySale,
                 uniqueOutputs,
                 null,
@@ -5462,7 +5513,6 @@ namespace CraftPeak
                 4,
                 280,
                 280,
-                16f,
                 legendarySale,
                 uniqueOutputs,
                 null,
@@ -5476,7 +5526,6 @@ namespace CraftPeak
                 RecipeTier.Masterwork,
                 4,
                 500,
-                12f,
                 new IngredientCost(StrangeGemItemId, 1),
                 new IngredientCost(WeirdShroomItemId, 1),
                 PickIngredient(uniqueOutputs, FlareItemId, 1),
@@ -5544,7 +5593,6 @@ namespace CraftPeak
             int requiredResourceLevel,
             int minimumMoney,
             int maximumMoney,
-            float successChance,
             List<ushort> salePool,
             List<ushort> previousCraftPool,
             List<ushort> outputCollector,
@@ -5643,7 +5691,6 @@ namespace CraftPeak
                     tier,
                     requiredResourceLevel,
                     moneyCost,
-                    successChance,
                     ingredients.ToArray());
 
                 if (outputCollector != null &&
@@ -5732,8 +5779,7 @@ namespace CraftPeak
                 "특수",
                 RecipeTier.Advanced,
                 2,
-                100,
-                100f);
+                100);
 
             CraftRecipe createdRecipe;
 
@@ -5947,7 +5993,6 @@ namespace CraftPeak
             RecipeTier tier,
             int requiredResourceLevel,
             int moneyCost,
-            float successChance,
             params IngredientCost[] ingredients)
         {
             Item prefab;
@@ -5979,8 +6024,7 @@ namespace CraftPeak
                             requiredResourceLevel,
                             0,
                             ResourceUpgradeMaximum),
-                    MoneyCost = Mathf.Max(0, moneyCost),
-                    SuccessChance = Mathf.Clamp(successChance, 0f, 100f)
+                    MoneyCost = Mathf.Max(0, moneyCost)
                 };
 
             if (ingredients != null)
@@ -6957,13 +7001,23 @@ namespace CraftPeak
             global::Player player =
                 global::Player.localPlayer;
 
-            // 일반 슬롯 또는 실제 손 슬롯(tempFullSlot 250) 중 하나라도 비어 있으면
-            // 제작을 허용합니다. 손 슬롯까지 차 있으면 호스트가 완성품을 맵에 생성합니다.
             if (player == null)
             {
                 SetTabStatus(
                     HubTab.Craft,
                     "플레이어 인벤토리를 찾지 못했습니다.");
+
+                return;
+            }
+
+            // 일반 인벤토리, 기존 스택 또는 가상 손 슬롯(tempFullSlot 250)에
+            // 완성품을 받을 공간이 없으면 제작 요청 자체를 보내지 않습니다.
+            if (!player.HasEmptySlot(
+                    recipe.OutputItemId))
+            {
+                SetTabStatus(
+                    HubTab.Craft,
+                    "완성품을 받을 빈 슬롯이 없어 제작할 수 없습니다.");
 
                 return;
             }
@@ -7077,16 +7131,6 @@ namespace CraftPeak
             }
         }
 
-        internal float SelectedUpgradeChance
-        {
-            get
-            {
-                return
-                    GetNextUpgradeChance(
-                        selectedUpgradeKind);
-            }
-        }
-
         internal string SelectedUpgradeCurrentEffect
         {
             get
@@ -7104,30 +7148,6 @@ namespace CraftPeak
                 return
                     GetUpgradeNextEffect(
                         selectedUpgradeKind);
-            }
-        }
-
-        internal bool UpgradeFailureActive
-        {
-            get
-            {
-                return
-                    failureEnabledConfig ==
-                        null ||
-                    failureEnabledConfig
-                        .Value;
-            }
-        }
-
-        internal bool UpgradeFailureConsumesCost
-        {
-            get
-            {
-                return
-                    consumeCostOnFailureConfig ==
-                        null ||
-                    consumeCostOnFailureConfig
-                        .Value;
             }
         }
 
@@ -7404,6 +7424,9 @@ namespace CraftPeak
             selectedSellSlotId =
                 slotId;
 
+            selectedSellQuantity =
+                1;
+
             ItemSlot slot =
                 player.GetItemSlot(
                     (byte)slotId);
@@ -7451,6 +7474,9 @@ namespace CraftPeak
                 selectedSellSlotId >=
                     player.itemSlots.Length)
             {
+                selectedSellQuantity =
+                    1;
+
                 return
                     "판매할 인벤토리 슬롯을 선택하세요.";
             }
@@ -7463,6 +7489,9 @@ namespace CraftPeak
                 slot.IsEmpty() ||
                 slot.prefab == null)
             {
+                selectedSellQuantity =
+                    1;
+
                 return
                     "선택한 슬롯이 비어 있습니다.";
             }
@@ -7473,6 +7502,9 @@ namespace CraftPeak
             if (!Spawn.IsSaleResourceId(
                     itemId))
             {
+                selectedSellQuantity =
+                    1;
+
                 return
                     "선택 아이템: " +
                     GetItemDisplayName(
@@ -7480,9 +7512,14 @@ namespace CraftPeak
                     "\n이 아이템은 판매 대상 자원이 아닙니다.";
             }
 
-            int price =
-                GetSellPrice(
-                    itemId);
+            int unitPrice =
+                Mathf.Max(
+                    0,
+                    GetSellPrice(
+                        itemId) *
+                    NormalizeSellMultiplier(
+                        upgradeState
+                            .SellMultiplier));
 
             int count =
                 Mathf.Max(
@@ -7492,8 +7529,18 @@ namespace CraftPeak
                             player,
                             (byte)selectedSellSlotId));
 
+            selectedSellQuantity =
+                Mathf.Clamp(
+                    selectedSellQuantity,
+                    1,
+                    count);
+
+            int totalPrice =
+                unitPrice *
+                selectedSellQuantity;
+
             canSell =
-                price >
+                unitPrice >
                     0 &&
                 pendingRequest ==
                     PendingRequest.None;
@@ -7507,9 +7554,19 @@ namespace CraftPeak
                     itemId) +
                 "   |   보유: " +
                 count +
-                "개\n판매가: " +
-                price +
-                "원";
+                "개\n판매 수량: " +
+                selectedSellQuantity +
+                "/" +
+                count +
+                "개" +
+                "\n개당 판매가: " +
+                unitPrice +
+                "원" +
+                "\n예상 판매액: " +
+                totalPrice +
+                "원" +
+                "\n\n마우스 휠 ↑↓: 1개씩 조절" +
+                "\nShift + 휠: 5개씩 조절";
         }
 
         internal void RequestSell()
@@ -7565,6 +7622,23 @@ namespace CraftPeak
             ushort itemId =
                 slot.prefab.itemID;
 
+            int stackCount =
+                Mathf.Max(
+                    1,
+                    InventoryStack
+                        .GetStackCount(
+                            player,
+                            slotId));
+
+            int requestedQuantity =
+                Mathf.Clamp(
+                    selectedSellQuantity,
+                    1,
+                    stackCount);
+
+            selectedSellQuantity =
+                requestedQuantity;
+
             string guid =
                 slot.data != null
                     ? slot.data.guid
@@ -7579,13 +7653,15 @@ namespace CraftPeak
 
             SetTabStatus(
                 HubTab.Sell,
-                "판매 요청을 처리 중입니다...");
+                requestedQuantity +
+                "개 판매 요청을 처리 중입니다...");
 
             object[] payload =
             {
                 selectedSellSlotId,
                 (int)itemId,
-                guid
+                guid,
+                requestedQuantity
             };
 
             int actor =
@@ -8032,22 +8108,23 @@ namespace CraftPeak
 
         private void BindUpgradeConfig()
         {
-            failureEnabledConfig = Config.Bind(
-                "01. 강화 공통 설정",
-                "강화 실패 활성화",
-                true,
-                "비활성화하면 모든 강화가 100% 성공합니다.");
+            resourceUpgradeFormula =
+                BindFormula(
+                    "02. 자원 등급 강화",
+                    20,
+                    40);
 
-            consumeCostOnFailureConfig = Config.Bind(
-                "01. 강화 공통 설정",
-                "실패 시 비용 소모",
-                true,
-                "활성화하면 강화 실패 시에도 공유 돈에서 비용이 차감됩니다.");
+            stackUpgradeFormula =
+                BindFormula(
+                    "04. 인벤토리 적재 강화",
+                    12,
+                    18);
 
-            resourceUpgradeFormula = BindFormula("02. 자원 등급 강화", 20, 40, 100f, 15f);
-            gatherUpgradeFormula = BindFormula("03. 채집 속도 강화", 15, 20, 100f, 15f);
-            stackUpgradeFormula = BindFormula("04. 인벤토리 적재 강화", 12, 18, 100f, 14f);
-            campfireUpgradeFormula = BindFormula("05. 모닥불 효율 강화", 20, 50, 90f, 15f);
+            campfireUpgradeFormula =
+                BindFormula(
+                    "05. 모닥불 효율 강화",
+                    20,
+                    50);
 
             doubleYieldCostConfig = Config.Bind(
                 "06. 수집량 배율 강화",
@@ -8057,28 +8134,17 @@ namespace CraftPeak
                     "수집량 배율 강화의 1단계 기본 비용입니다. x3, x4, x5 단계는 각각 기본 비용의 2배, 3배, 4배입니다.",
                     new AcceptableValueRange<int>(0, 100000)));
 
-            doubleYieldChanceConfig = Config.Bind(
-                "06. 수집량 배율 강화",
-                "성공 확률",
-                55f,
-                new ConfigDescription(
-                    "수집량 x2 강화의 시작 성공 확률입니다. 이후 x3, x4, x5 단계마다 성공 확률이 10%p씩 감소합니다.",
-                    new AcceptableValueRange<float>(0f, 100f)));
-
-            sellValueUpgradeFormula = BindFormula(
-                "07. 아이템 판매 수익 강화",
-                40,
-                60,
-                80f,
-                15f);
+            sellValueUpgradeFormula =
+                BindFormula(
+                    "07. 아이템 판매 수익 강화",
+                    40,
+                    60);
         }
 
         private UpgradeFormulaConfig BindFormula(
             string section,
             int baseCost,
-            int costGrowth,
-            float startChance,
-            float chanceLoss)
+            int costGrowth)
         {
             return new UpgradeFormulaConfig
             {
@@ -8096,23 +8162,7 @@ namespace CraftPeak
                     costGrowth,
                     new ConfigDescription(
                         "다음 단계마다 추가되는 비용입니다.",
-                        new AcceptableValueRange<int>(0, 100000))),
-
-                StartChance = Config.Bind(
-                    section,
-                    "1단계 성공 확률",
-                    startChance,
-                    new ConfigDescription(
-                        "첫 단계 성공 확률입니다.",
-                        new AcceptableValueRange<float>(0f, 100f))),
-
-                ChanceLoss = Config.Bind(
-                    section,
-                    "단계별 성공 확률 감소",
-                    chanceLoss,
-                    new ConfigDescription(
-                        "다음 단계마다 감소하는 성공 확률입니다.",
-                        new AcceptableValueRange<float>(0f, 100f)))
+                        new AcceptableValueRange<int>(0, 100000)))
             };
         }
 
@@ -8148,17 +8198,8 @@ namespace CraftPeak
                     upgradeState.RunId =
                         runId;
 
-                    upgradeState.BaseHoldSeconds =
-                        Mathf.Clamp(
-                            LongE.PickupHoldSeconds,
-                            0.1f,
-                            60f);
-
                     upgradeState.BaseStackCount =
-                        Mathf.Clamp(
-                            InventoryStack.MaximumStackCount,
-                            1,
-                            100);
+                        DefaultBaseStackCount;
 
                     upgradeState.BaseCampfireMaterials =
                         new[]
@@ -8236,8 +8277,8 @@ namespace CraftPeak
             UpgradeState fresh = UpgradeState.CreateDefault();
             fresh.RunId = runId ?? string.Empty;
             fresh.OwnerActor = LocalActorNumber();
-            fresh.BaseHoldSeconds = Mathf.Clamp(LongE.PickupHoldSeconds, 0.1f, 60f);
-            fresh.BaseStackCount = Mathf.Clamp(InventoryStack.MaximumStackCount, 1, 100);
+            fresh.BaseStackCount =
+                DefaultBaseStackCount;
             fresh.BaseCampfireMaterials = new[]
             {
                 Mathf.Max(0, CampfireGate.RequiredFireWoodCount),
@@ -8292,8 +8333,6 @@ namespace CraftPeak
                 incoming.RunId = ReadString(props, UpgradeRunIdKey);
                 incoming.ResourceLevel = Mathf.Clamp(
                     ReadInt(props, UpgradeResourceKey, 0), 0, ResourceUpgradeMaximum);
-                incoming.GatherLevel = Mathf.Clamp(
-                    ReadInt(props, UpgradeGatherKey, 0), 0, GatherUpgradeMaximum);
                 incoming.StackLevel = Mathf.Clamp(
                     ReadInt(props, UpgradeStackKey, 0), 0, StackUpgradeMaximum);
                 incoming.CampfireLevel = Mathf.Clamp(
@@ -8312,10 +8351,8 @@ namespace CraftPeak
                         UpgradeSellMultiplierKey,
                         1));
 
-                incoming.BaseHoldSeconds = Mathf.Clamp(
-                    ReadFloat(props, UpgradeBaseHoldKey, 10f), 0.1f, 60f);
-                incoming.BaseStackCount = Mathf.Clamp(
-                    ReadInt(props, UpgradeBaseStackKey, 10), 1, 100);
+                incoming.BaseStackCount =
+                    DefaultBaseStackCount;
                 incoming.BaseCampfireMaterials = ReadIntArray(
                     props,
                     UpgradeBaseCampfireKey,
@@ -8376,12 +8413,10 @@ namespace CraftPeak
                     { UpgradeOwnerKey, safe.OwnerActor },
                     { UpgradeRunIdKey, safe.RunId ?? string.Empty },
                     { UpgradeResourceKey, safe.ResourceLevel },
-                    { UpgradeGatherKey, safe.GatherLevel },
                     { UpgradeStackKey, safe.StackLevel },
                     { UpgradeCampfireKey, safe.CampfireLevel },
                     { UpgradeYieldKey, safe.YieldMultiplier },
                     { UpgradeSellMultiplierKey, safe.SellMultiplier },
-                    { UpgradeBaseHoldKey, safe.BaseHoldSeconds },
                     { UpgradeBaseStackKey, safe.BaseStackCount },
                     { UpgradeBaseCampfireKey, CloneIntArray(safe.BaseCampfireMaterials) }
                 };
@@ -8400,7 +8435,6 @@ namespace CraftPeak
             Logger.LogInfo(
                 "Upgrade upgradeState published. Reason=" + reason +
                 " | Resource=" + safe.ResourceLevel +
-                " | Gather=" + safe.GatherLevel +
                 " | Stack=" + safe.StackLevel +
                 " | Campfire=" + safe.CampfireLevel +
                 " | Yield=x" + safe.YieldMultiplier +
@@ -8418,14 +8452,13 @@ namespace CraftPeak
             safe.OwnerActor = Mathf.Max(0, safe.OwnerActor);
             safe.RunId = safe.RunId ?? string.Empty;
             safe.ResourceLevel = Mathf.Clamp(safe.ResourceLevel, 0, ResourceUpgradeMaximum);
-            safe.GatherLevel = Mathf.Clamp(safe.GatherLevel, 0, GatherUpgradeMaximum);
             safe.StackLevel = Mathf.Clamp(safe.StackLevel, 0, StackUpgradeMaximum);
             safe.CampfireLevel = Mathf.Clamp(safe.CampfireLevel, 0, CampfireUpgradeMaximum);
             safe.YieldMultiplier = Mathf.Clamp(safe.YieldMultiplier, 1, 5);
             safe.SellMultiplier = NormalizeSellMultiplier(
                 safe.SellMultiplier);
-            safe.BaseHoldSeconds = Mathf.Clamp(safe.BaseHoldSeconds, 0.1f, 60f);
-            safe.BaseStackCount = Mathf.Clamp(safe.BaseStackCount, 1, 100);
+            safe.BaseStackCount =
+                DefaultBaseStackCount;
             safe.BaseCampfireMaterials = EnsureThree(
                 safe.BaseCampfireMaterials,
                 new[] { 1, 1, 1 });
@@ -8480,10 +8513,6 @@ namespace CraftPeak
         {
             ResourceYieldMultiplier = Mathf.Clamp(upgradeState.YieldMultiplier, 1, 5);
 
-            float holdSeconds = CalculateEffectiveHoldSeconds(upgradeState);
-            if (!Mathf.Approximately(LongE.PickupHoldSeconds, holdSeconds))
-                LongE.SetPickupHoldSeconds(holdSeconds);
-
             ApplyCampfireRequirements(CalculateEffectiveCampfireMaterials(upgradeState));
 
             if (PhotonNetwork.IsMasterClient)
@@ -8503,7 +8532,6 @@ namespace CraftPeak
 
             Logger.LogDebug(
                 "Upgrade effects applied. Reason=" + reason +
-                " | Hold=" + holdSeconds.ToString("0.00") +
                 " | Stack=" + CalculateEffectiveStackMaximum(upgradeState) +
                 " | Yield=x" + ResourceYieldMultiplier);
         }
@@ -8515,7 +8543,6 @@ namespace CraftPeak
             if (!upgradeStateLoaded)
                 return;
 
-            LongE.SetPickupHoldSeconds(upgradeState.BaseHoldSeconds);
             ApplyCampfireRequirements(CloneIntArray(upgradeState.BaseCampfireMaterials));
 
             if (PhotonNetwork.IsMasterClient)
@@ -8532,15 +8559,6 @@ namespace CraftPeak
 
             lastAppliedUpgradeRevision = -1;
             lastAppliedUpgradeRunId = string.Empty;
-        }
-
-        private static float CalculateEffectiveHoldSeconds(UpgradeState value)
-        {
-            int level = Mathf.Clamp(value.GatherLevel, 0, GatherUpgradeMaximum);
-            return Mathf.Clamp(
-                value.BaseHoldSeconds * GatherTimeFactors[level],
-                0.1f,
-                60f);
         }
 
         private static int CalculateEffectiveStackMaximum(UpgradeState value)
@@ -8652,7 +8670,6 @@ namespace CraftPeak
             }
 
             int cost = GetNextUpgradeCost(kind);
-            float chance = GetNextUpgradeChance(kind);
             int money = ReadSharedMoney();
 
             CraftConsumptionPlan campfirePlan = null;
@@ -8722,16 +8739,6 @@ namespace CraftPeak
                 return;
             }
 
-            bool failureActive =
-                failureEnabledConfig == null ||
-                failureEnabledConfig.Value;
-
-            bool success =
-                kind == UpgradeKind.CampfireEfficiency
-                    ? UnityEngine.Random.Range(0f, 100f) < chance
-                    : !failureActive ||
-                      UnityEngine.Random.Range(0f, 100f) < chance;
-
             if (campfirePlan != null)
             {
                 List<ConsumedSelectedSlot> consumedSlots;
@@ -8754,115 +8761,16 @@ namespace CraftPeak
                 partyResourceCacheUntil = 0f;
             }
 
-            bool consumeMoney =
-                kind == UpgradeKind.CampfireEfficiency ||
-                success ||
-                consumeCostOnFailureConfig == null ||
-                consumeCostOnFailureConfig.Value;
-
-            if (consumeMoney)
-                SetSharedMoneyOnHost(money - cost);
-
-            if (!success)
-            {
-                if (kind == UpgradeKind.SellValue)
-                {
-                    int preservedSellMultiplier =
-                        NormalizeSellMultiplier(
-                            upgradeState.SellMultiplier);
-
-                    SendUpgradeResult(
-                        actor,
-                        false,
-                        "아이템 판매 수익 강화에 실패했습니다.\n" +
-                        "현재 판매 수익 x" +
-                        preservedSellMultiplier +
-                        " 단계는 유지됩니다.\n" +
-                        (
-                            consumeMoney
-                                ? cost + "원이 소모되었습니다."
-                                : "비용은 소모되지 않았습니다."
-                        ));
-
-                    return;
-                }
-
-                if (kind == UpgradeKind.DoubleYield)
-                {
-                    // 수집량 배율은 실패해도 현재 단계를 명시적으로 유지합니다.
-                    // 실패 처리에서는 UpgradeState를 변경하거나 다시 저장하지 않습니다.
-                    int preservedMultiplier =
-                        Mathf.Clamp(
-                            upgradeState.YieldMultiplier,
-                            1,
-                            YieldUpgradeMaximum + 1);
-
-                    ResourceYieldMultiplier =
-                        preservedMultiplier;
-
-                    string yieldFailureMessage =
-                        "수집량 배율 강화에 실패했습니다.\n" +
-                        "현재 수집량 x" +
-                        preservedMultiplier +
-                        " 단계는 유지됩니다.\n" +
-                        (
-                            consumeMoney
-                                ? cost + "원이 소모되었습니다."
-                                : "비용은 소모되지 않았습니다."
-                        );
-
-                    SendUpgradeResult(
-                        actor,
-                        false,
-                        yieldFailureMessage);
-
-                    Logger.LogInfo(
-                        "Yield upgrade failed without downgrade. Actor=" +
-                        actor +
-                        " | Preserved=x" +
-                        preservedMultiplier +
-                        " | Chance=" +
-                        chance +
-                        " | Cost=" +
-                        cost);
-
-                    return;
-                }
-
-                string failureMessage =
-                    kind == UpgradeKind.CampfireEfficiency
-                        ? "다음 모닥불 제작에 실패했습니다.\n재료와 " +
-                          cost +
-                          "원이 모두 소모되었습니다."
-                        : GetUpgradeDisplayName(kind) +
-                          " 강화에 실패했습니다.\n" +
-                          (
-                              consumeMoney
-                                  ? cost + "원이 소모되었습니다."
-                                  : "비용은 소모되지 않았습니다."
-                          );
-
-                SendUpgradeResult(
-                    actor,
-                    false,
-                    failureMessage);
-
-                Logger.LogInfo(
-                    "Upgrade failed. Actor=" + actor +
-                    " | Kind=" + kind +
-                    " | Chance=" + chance +
-                    " | Cost=" + cost);
-
-                return;
-            }
+            SetSharedMoneyOnHost(
+                money - cost);
 
             UpgradeState upgraded = upgradeState.Clone();
             IncreaseUpgradeLevel(upgraded, kind);
 
-            if (!PublishUpgradeState(upgraded, "Upgrade success: " + kind))
+            if (!PublishUpgradeState(upgraded, "Upgrade completed: " + kind))
             {
-                if (consumeMoney)
-                    SetSharedMoneyOnHost(ReadSharedMoney() + cost);
+                SetSharedMoneyOnHost(
+                    ReadSharedMoney() + cost);
 
                 SendUpgradeResult(
                     actor,
@@ -8875,7 +8783,7 @@ namespace CraftPeak
                 actor,
                 true,
                 GetUpgradeDisplayName(kind) +
-                " 강화 성공!\n" +
+                " 강화 완료\n" +
                 GetUpgradeCurrentEffect(kind));
 
             if (kind ==
@@ -8899,10 +8807,6 @@ namespace CraftPeak
             {
                 case UpgradeKind.ResourceGrade:
                     value.ResourceLevel = Mathf.Min(ResourceUpgradeMaximum, value.ResourceLevel + 1);
-                    break;
-
-                case UpgradeKind.GatherSpeed:
-                    value.GatherLevel = Mathf.Min(GatherUpgradeMaximum, value.GatherLevel + 1);
                     break;
 
                 case UpgradeKind.StackCapacity:
@@ -8971,8 +8875,6 @@ namespace CraftPeak
             {
                 case UpgradeKind.ResourceGrade:
                     return upgradeState.ResourceLevel;
-                case UpgradeKind.GatherSpeed:
-                    return upgradeState.GatherLevel;
                 case UpgradeKind.StackCapacity:
                     return upgradeState.StackLevel;
                 case UpgradeKind.CampfireEfficiency:
@@ -9011,8 +8913,6 @@ namespace CraftPeak
             {
                 case UpgradeKind.ResourceGrade:
                     return ResourceUpgradeMaximum;
-                case UpgradeKind.GatherSpeed:
-                    return GatherUpgradeMaximum;
                 case UpgradeKind.StackCapacity:
                     return StackUpgradeMaximum;
                 case UpgradeKind.CampfireEfficiency:
@@ -9034,8 +8934,6 @@ namespace CraftPeak
             {
                 case UpgradeKind.ResourceGrade:
                     return resourceUpgradeFormula;
-                case UpgradeKind.GatherSpeed:
-                    return gatherUpgradeFormula;
                 case UpgradeKind.StackCapacity:
                     return stackUpgradeFormula;
                 case UpgradeKind.CampfireEfficiency:
@@ -9092,64 +8990,12 @@ namespace CraftPeak
             return baseCost + growth * Mathf.Max(0, nextLevel - 1);
         }
 
-        private float GetNextUpgradeChance(UpgradeKind kind)
-        {
-            if (kind == UpgradeKind.CampfireEfficiency)
-            {
-                CampfireBuildRecipe campfire =
-                    GetNextCampfireRecipe();
-
-                return
-                    campfire != null
-                        ? campfire.SuccessChance
-                        : 0f;
-            }
-
-            if (failureEnabledConfig != null && !failureEnabledConfig.Value)
-                return 100f;
-
-            int nextLevel = GetUpgradeCurrentLevel(kind) + 1;
-
-            if (kind == UpgradeKind.DoubleYield)
-            {
-                float startChance =
-                    doubleYieldChanceConfig != null
-                        ? doubleYieldChanceConfig.Value
-                        : 55f;
-
-                return
-                    Mathf.Clamp(
-                        startChance -
-                        10f *
-                        Mathf.Max(
-                            0,
-                            nextLevel - 1),
-                        0f,
-                        100f);
-            }
-
-            UpgradeFormulaConfig formula = GetUpgradeFormula(kind);
-            float start = formula != null && formula.StartChance != null
-                ? formula.StartChance.Value
-                : 100f;
-            float loss = formula != null && formula.ChanceLoss != null
-                ? formula.ChanceLoss.Value
-                : 0f;
-
-            return Mathf.Clamp(
-                start - loss * Mathf.Max(0, nextLevel - 1),
-                0f,
-                100f);
-        }
-
         internal string GetUpgradeDisplayName(UpgradeKind kind)
         {
             switch (kind)
             {
                 case UpgradeKind.ResourceGrade:
                     return "자원 등급";
-                case UpgradeKind.GatherSpeed:
-                    return "채집 속도";
                 case UpgradeKind.StackCapacity:
                     return "인벤토리 적재량";
                 case UpgradeKind.CampfireEfficiency:
@@ -9171,9 +9017,6 @@ namespace CraftPeak
             {
                 case UpgradeKind.ResourceGrade:
                     return "현재 해금 등급: " + GetResourceGradeName(upgradeState.ResourceLevel);
-
-                case UpgradeKind.GatherSpeed:
-                    return "현재 채집 시간: " + CalculateEffectiveHoldSeconds(upgradeState).ToString("0.00") + "초";
 
                 case UpgradeKind.StackCapacity:
                     return "현재 최대 적재량: " + CalculateEffectiveStackMaximum(upgradeState) + "개";
@@ -9208,10 +9051,6 @@ namespace CraftPeak
             {
                 case UpgradeKind.ResourceGrade:
                     return "다음 효과: " + GetResourceGradeName(preview.ResourceLevel) + " 등급 해금";
-
-                case UpgradeKind.GatherSpeed:
-                    return "다음 효과: 채집 시간 " +
-                           CalculateEffectiveHoldSeconds(preview).ToString("0.00") + "초";
 
                 case UpgradeKind.StackCapacity:
                     return "다음 효과: 슬롯당 " +
@@ -9487,12 +9326,10 @@ namespace CraftPeak
                    values.ContainsKey(UpgradeOwnerKey) ||
                    values.ContainsKey(UpgradeRunIdKey) ||
                    values.ContainsKey(UpgradeResourceKey) ||
-                   values.ContainsKey(UpgradeGatherKey) ||
                    values.ContainsKey(UpgradeStackKey) ||
                    values.ContainsKey(UpgradeCampfireKey) ||
                    values.ContainsKey(UpgradeYieldKey) ||
                    values.ContainsKey(UpgradeSellMultiplierKey) ||
-                   values.ContainsKey(UpgradeBaseHoldKey) ||
                    values.ContainsKey(UpgradeBaseStackKey) ||
                    values.ContainsKey(UpgradeBaseCampfireKey);
         }
@@ -9733,21 +9570,58 @@ namespace CraftPeak
                 !PhotonNetwork.IsMasterClient ||
                 ResourceYieldMultiplier <= 1 ||
                 player == null ||
-                !Spawn.IsSaleResourceId(itemId))
+                !Spawn.IsSaleResourceId(
+                    itemId))
+            {
                 return;
+            }
 
-            if (CountPlayerResourceUnits(player, itemId) <= countBefore)
+            int safeCountBefore =
+                Mathf.Max(
+                    0,
+                    countBefore);
+
+            int currentTotal =
+                CountPlayerResourceUnits(
+                    player,
+                    itemId);
+
+            // 원본 수집이 실제로 수량을 늘리지 못했다면
+            // CraftHub가 별도로 자원을 생성하지 않습니다.
+            if (currentTotal <=
+                safeCountBefore)
+            {
                 return;
+            }
 
-            int wanted = ResourceYieldMultiplier - 1;
-            int granted = 0;
+            int expectedTotal =
+                safeCountBefore +
+                Mathf.Max(
+                    1,
+                    ResourceYieldMultiplier);
 
-            for (int i = 0; i < wanted; i++)
+            int wanted =
+                Mathf.Max(
+                    0,
+                    expectedTotal -
+                    currentTotal);
+
+            int granted =
+                0;
+
+            for (int i = 0;
+                 i < wanted;
+                 i++)
             {
                 ItemSlot slot;
 
-                if (!player.AddItem(itemId, null, out slot))
+                if (!player.AddItem(
+                        itemId,
+                        null,
+                        out slot))
+                {
                     break;
+                }
 
                 granted++;
             }
@@ -9755,8 +9629,24 @@ namespace CraftPeak
             if (ModLogger != null)
             {
                 ModLogger.LogInfo(
-                    "Resource yield bonus. ItemID=" + itemId +
-                    " | Granted=" + granted + "/" + wanted);
+                    "Resource yield reconciliation. ItemID=" +
+                    itemId +
+                    " | Multiplier=x" +
+                    ResourceYieldMultiplier +
+                    " | Before=" +
+                    safeCountBefore +
+                    " | BeforeReconcile=" +
+                    currentTotal +
+                    " | Expected=" +
+                    expectedTotal +
+                    " | Granted=" +
+                    granted +
+                    "/" +
+                    wanted +
+                    " | Final=" +
+                    CountPlayerResourceUnits(
+                        player,
+                        itemId));
             }
         }
 
@@ -9814,12 +9704,19 @@ namespace CraftPeak
             int slotIdValue;
             int expectedItemId;
             string expectedGuid;
+            int requestedQuantity;
 
             try
             {
                 slotIdValue = Convert.ToInt32(requestData[0]);
                 expectedItemId = Convert.ToInt32(requestData[1]);
                 expectedGuid = requestData[2] as string;
+                requestedQuantity =
+                    requestData.Length >
+                        3
+                        ? Convert.ToInt32(
+                            requestData[3])
+                        : 1;
             }
             catch (Exception)
             {
@@ -9836,7 +9733,8 @@ namespace CraftPeak
 
             if (slotIdValue < 0 ||
                 slotIdValue > byte.MaxValue ||
-                string.IsNullOrEmpty(expectedGuid))
+                string.IsNullOrEmpty(expectedGuid) ||
+                requestedQuantity <= 0)
             {
                 SendSellResult(
                     actorNumber,
@@ -9921,14 +9819,14 @@ namespace CraftPeak
                 return;
             }
 
-            int salePrice =
+            int unitSalePrice =
                 Mathf.Max(
                     0,
                     GetSellPrice(actualItemId) *
                     NormalizeSellMultiplier(
                         upgradeState.SellMultiplier));
 
-            if (salePrice <= 0)
+            if (unitSalePrice <= 0)
             {
                 SendSellResult(
                     actorNumber,
@@ -9941,46 +9839,337 @@ namespace CraftPeak
                 return;
             }
 
-            int transactionId = ++nextSaleTransactionId;
+            int availableCount =
+                Mathf.Max(
+                    1,
+                    InventoryStack
+                        .GetStackCount(
+                            player,
+                            slotId));
 
-            if (transactionId <= 0)
+            if (requestedQuantity >
+                availableCount)
             {
-                nextSaleTransactionId = 1;
-                transactionId = 1;
-            }
-
-            PendingSaleTransaction transaction =
-                new PendingSaleTransaction
-                {
-                    TransactionId = transactionId,
-                    ActorNumber = actorNumber,
-                    SlotId = slotId,
-                    ItemId = actualItemId,
-                    ItemGuid = actualGuid,
-                    ItemName = GetItemDisplayName(slot.prefab),
-                    SalePrice = salePrice,
-                    CreatedAt = PhotonNetwork.Time
-                };
-
-            pendingSaleTransactions[transactionId] =
-                transaction;
-
-            reservedOrSoldItemGuids.Add(actualGuid);
-
-            if (!SendSellConsumeRequest(transaction))
-            {
-                pendingSaleTransactions.Remove(transactionId);
-                reservedOrSoldItemGuids.Remove(actualGuid);
-
                 SendSellResult(
                     actorNumber,
                     false,
-                    "판매 아이템 제거 요청 전송에 실패했습니다.",
+                    "보유 수량보다 많이 판매할 수 없습니다.",
                     0,
                     ReadSharedMoney(),
                     slotIdValue,
                     actualItemId);
+                return;
             }
+
+            reservedOrSoldItemGuids.Add(
+                actualGuid);
+
+            int consumedQuantity;
+            int remainingCount;
+            string remainingGuid;
+            string consumeFailure;
+
+            bool consumed =
+                TryConsumeSaleQuantityOnHost(
+                    player,
+                    slotId,
+                    actualItemId,
+                    actualGuid,
+                    requestedQuantity,
+                    out consumedQuantity,
+                    out remainingCount,
+                    out remainingGuid,
+                    out consumeFailure);
+
+            reservedOrSoldItemGuids.Remove(
+                actualGuid);
+
+            if (!consumed ||
+                consumedQuantity <= 0)
+            {
+                SendSellResult(
+                    actorNumber,
+                    false,
+                    string.IsNullOrEmpty(
+                        consumeFailure)
+                        ? "판매 수량을 인벤토리에서 제거하지 못했습니다."
+                        : consumeFailure,
+                    0,
+                    ReadSharedMoney(),
+                    slotIdValue,
+                    actualItemId);
+                return;
+            }
+
+            int totalPrice =
+                unitSalePrice *
+                consumedQuantity;
+
+            int newBalance =
+                Mathf.Max(
+                    0,
+                    ReadSharedMoney() +
+                    totalPrice);
+
+            SetSharedMoneyOnHost(
+                newBalance);
+
+            partyResourceCacheUntil =
+                0f;
+
+            SendSellResult(
+                actorNumber,
+                true,
+                GetItemDisplayName(
+                    slot.prefab) +
+                " " +
+                consumedQuantity +
+                "개 판매 완료: +" +
+                totalPrice +
+                "원" +
+                (
+                    remainingCount >
+                        0
+                        ? "\n남은 수량: " +
+                          remainingCount +
+                          "개"
+                        : string.Empty
+                ),
+                totalPrice,
+                newBalance,
+                slotIdValue,
+                actualItemId);
+        }
+
+        private static bool TryConsumeSaleQuantityOnHost(
+            global::Player player,
+            byte slotId,
+            ushort itemId,
+            string expectedGuid,
+            int requestedQuantity,
+            out int consumedQuantity,
+            out int remainingCount,
+            out string remainingGuid,
+            out string failureMessage)
+        {
+            consumedQuantity =
+                0;
+
+            remainingCount =
+                0;
+
+            remainingGuid =
+                string.Empty;
+
+            failureMessage =
+                string.Empty;
+
+            if (!PhotonNetwork.IsMasterClient ||
+                InventoryStack.Instance == null ||
+                player == null ||
+                requestedQuantity <= 0)
+            {
+                failureMessage =
+                    "호스트 인벤토리 처리 상태가 올바르지 않습니다.";
+
+                return false;
+            }
+
+            ItemSlot initialSlot =
+                player.GetItemSlot(
+                    slotId);
+
+            if (initialSlot == null ||
+                initialSlot.IsEmpty() ||
+                initialSlot.prefab == null ||
+                initialSlot.prefab.itemID !=
+                    itemId)
+            {
+                failureMessage =
+                    "판매 직전에 슬롯의 아이템이 변경되었습니다.";
+
+                return false;
+            }
+
+            string initialGuid =
+                initialSlot.data != null
+                    ? initialSlot.data.guid
+                        .ToString()
+                    : string.Empty;
+
+            if (string.IsNullOrEmpty(
+                    initialGuid) ||
+                !string.Equals(
+                    initialGuid,
+                    expectedGuid,
+                    StringComparison.Ordinal))
+            {
+                failureMessage =
+                    "판매 직전에 아이템 GUID가 변경되었습니다.";
+
+                return false;
+            }
+
+            int countBefore =
+                Mathf.Max(
+                    1,
+                    InventoryStack
+                        .GetStackCount(
+                            player,
+                            slotId));
+
+            if (requestedQuantity >
+                countBefore)
+            {
+                failureMessage =
+                    "판매 요청 수량이 현재 보유 수량보다 많습니다.";
+
+                return false;
+            }
+
+            bool selectedBefore =
+                player.character != null &&
+                player.character.refs != null &&
+                player.character.refs.items != null &&
+                player.character.refs.items
+                    .currentSelectedSlot.IsSome &&
+                player.character.refs.items
+                    .currentSelectedSlot.Value ==
+                    slotId;
+
+            for (int i = 0;
+                 i < requestedQuantity;
+                 i++)
+            {
+                ItemSlot currentSlot =
+                    player.GetItemSlot(
+                        slotId);
+
+                if (currentSlot == null ||
+                    currentSlot.IsEmpty() ||
+                    currentSlot.prefab == null ||
+                    currentSlot.prefab.itemID !=
+                        itemId)
+                {
+                    break;
+                }
+
+                string currentGuid =
+                    currentSlot.data != null
+                        ? currentSlot.data.guid
+                            .ToString()
+                        : string.Empty;
+
+                if (!string.Equals(
+                        currentGuid,
+                        expectedGuid,
+                        StringComparison.Ordinal))
+                {
+                    break;
+                }
+
+                int currentCount =
+                    Mathf.Max(
+                        1,
+                        InventoryStack
+                            .GetStackCount(
+                                player,
+                                slotId));
+
+                if (currentCount >
+                    1)
+                {
+                    if (!InventoryStack.Instance
+                            .HostConsumeOneFromSlot(
+                                player,
+                                slotId,
+                                "CraftHub.BatchSale",
+                                false))
+                    {
+                        break;
+                    }
+                }
+                else
+                {
+                    currentSlot.EmptyOut();
+                }
+
+                consumedQuantity++;
+            }
+
+            SyncPlayerInventoryFromHost(
+                player);
+
+            HashSet<global::Player> touchedPlayers =
+                new HashSet<global::Player>
+                {
+                    player
+                };
+
+            RefreshCarryWeights(
+                touchedPlayers);
+
+            ItemSlot remainingSlot =
+                player.GetItemSlot(
+                    slotId);
+
+            if (remainingSlot != null &&
+                !remainingSlot.IsEmpty() &&
+                remainingSlot.prefab != null &&
+                remainingSlot.prefab.itemID ==
+                    itemId)
+            {
+                remainingCount =
+                    Mathf.Max(
+                        1,
+                        InventoryStack
+                            .GetStackCount(
+                                player,
+                                slotId));
+
+                remainingGuid =
+                    remainingSlot.data != null
+                        ? remainingSlot.data.guid
+                            .ToString()
+                        : string.Empty;
+            }
+
+            if (selectedBefore &&
+                remainingCount <=
+                    0 &&
+                player.character != null &&
+                player.character.photonView != null &&
+                player.character.photonView.Owner !=
+                    null &&
+                Instance != null)
+            {
+                Instance.BroadcastConsumedSelectedSlots(
+                    new List<ConsumedSelectedSlot>
+                    {
+                        new ConsumedSelectedSlot
+                        {
+                            ActorNumber =
+                                player.character
+                                    .photonView
+                                    .Owner
+                                    .ActorNumber,
+
+                            SlotId =
+                                slotId
+                        }
+                    });
+            }
+
+            if (consumedQuantity !=
+                requestedQuantity)
+            {
+                failureMessage =
+                    "판매 처리 중 인벤토리가 변경되어 요청한 수량을 모두 제거하지 못했습니다.";
+
+                return false;
+            }
+
+            return true;
         }
 
         private bool SendSellConsumeRequest(
@@ -10824,8 +11013,21 @@ namespace CraftPeak
                 return;
             }
 
-            // 일반 슬롯과 손 슬롯이 모두 차 있어도 제작 자체는 허용합니다.
-            // 지급 단계에서 AddItem이 실패하면 완성품을 플레이어 발앞 맵에 생성합니다.
+            // 클라이언트 판정만 신뢰하지 않고 호스트가 다시 확인합니다.
+            // 일반 인벤토리, 기존 스택 또는 가상 손 슬롯에 공간이 없으면
+            // 돈과 재료를 소비하기 전에 제작 요청을 거부합니다.
+            if (!requester.HasEmptySlot(
+                    outputId))
+            {
+                SendCraftResult(
+                    actorNumber,
+                    false,
+                    false,
+                    outputId,
+                    "완성품을 받을 빈 슬롯이 없어 제작할 수 없습니다.");
+
+                return;
+            }
 
             int money = ReadSharedMoney();
             if (money < recipe.MoneyCost)
@@ -10858,26 +11060,6 @@ namespace CraftPeak
             SetSharedMoneyOnHost(money - recipe.MoneyCost);
             BroadcastConsumedSelectedSlots(consumedSlots);
 
-            bool success = UnityEngine.Random.Range(0f, 100f) < recipe.SuccessChance;
-
-            if (!success)
-            {
-                SendCraftResult(
-                    actorNumber,
-                    true,
-                    false,
-                    outputId,
-                    recipe.DisplayName +
-                    " 제작에 실패했습니다.\n돈과 재료를 잃었습니다.");
-
-                Logger.LogInfo(
-                    "Craft failed. Actor=" + actorNumber +
-                    " | OutputID=" + outputId +
-                    " | Chance=" + recipe.SuccessChance +
-                    " | Money=" + recipe.MoneyCost);
-                return;
-            }
-
             ItemSlot grantedSlot;
             bool granted =
                 requester.AddItem(
@@ -10898,8 +11080,38 @@ namespace CraftPeak
                     requester,
                     grantedSlot);
 
-            bool spawnedOnMap =
-                false;
+            if (!inventoryOrHandGrant)
+            {
+                // 호스트가 소비 전에 빈 슬롯을 확인하므로 정상적으로는 도달하지 않습니다.
+                // 예기치 않은 지급 실패가 발생해도 월드에는 완성품을 생성하지 않습니다.
+                SetSharedMoneyOnHost(
+                    ReadSharedMoney() +
+                    recipe.MoneyCost);
+
+                SendCraftResult(
+                    actorNumber,
+                    true,
+                    false,
+                    outputId,
+                    "제작 완성품을 인벤토리에 지급하지 못했습니다.\n" +
+                    "돈은 환불됐지만 재료는 복구되지 않았습니다.");
+
+                Logger.LogError(
+                    "Craft output inventory delivery failed. Actor=" +
+                    actorNumber +
+                    " | OutputID=" +
+                    outputId +
+                    " | Granted=" +
+                    granted +
+                    " | GrantedSlot=" +
+                    (
+                        grantedSlot != null
+                            ? grantedSlot.itemSlotID.ToString()
+                            : "<null>"
+                    ));
+
+                return;
+            }
 
             if (grantedToHand)
             {
@@ -10914,46 +11126,6 @@ namespace CraftPeak
                             outputId));
                 }
             }
-            else if (!inventoryOrHandGrant)
-            {
-                // 일반 슬롯 1~3과 실제 손 슬롯 250이 모두 차 있으면
-                // 완성품을 잃지 않도록 플레이어 발앞 월드에 생성합니다.
-                spawnedOnMap =
-                    TrySpawnCraftOutputOnGround(
-                        requester,
-                        outputId);
-
-                if (!spawnedOnMap)
-                {
-                    SetSharedMoneyOnHost(
-                        ReadSharedMoney() +
-                        recipe.MoneyCost);
-
-                    SendCraftResult(
-                        actorNumber,
-                        true,
-                        false,
-                        outputId,
-                        "제작은 성공했지만 인벤토리·손 슬롯이 모두 가득 찼고 " +
-                        "맵 생성에도 실패했습니다.\n돈은 환불됐지만 재료는 복구되지 않았습니다.");
-
-                    Logger.LogError(
-                        "Craft output delivery failed. Actor=" +
-                        actorNumber +
-                        " | OutputID=" +
-                        outputId +
-                        " | Granted=" +
-                        granted +
-                        " | GrantedSlot=" +
-                        (
-                            grantedSlot != null
-                                ? grantedSlot.itemSlotID.ToString()
-                                : "<null>"
-                        ));
-
-                    return;
-                }
-            }
 
             SendCraftResult(
                 actorNumber,
@@ -10962,13 +11134,9 @@ namespace CraftPeak
                 outputId,
                 recipe.DisplayName +
                 (
-                    spawnedOnMap
-                        ? " 제작 성공! 인벤토리와 손이 가득 차 발앞 맵에 생성했습니다."
-                        : (
-                            grantedToHand
-                                ? " 제작 성공! 추가 손 슬롯에 장착했습니다."
-                                : " 제작에 성공했습니다!"
-                        )
+                    grantedToHand
+                        ? " 제작 성공! 추가 손 슬롯에 장착했습니다."
+                        : " 제작에 성공했습니다!"
                 ));
 
             if (outputId ==
@@ -10982,17 +11150,12 @@ namespace CraftPeak
                 " | OutputID=" + outputId +
                 " | Destination=" +
                 (
-                    spawnedOnMap
-                        ? "World"
-                        : (
-                            grantedToHand
-                                ? "SelectedHand250"
-                                : "Inventory"
-                        )
+                    grantedToHand
+                        ? "SelectedHand250"
+                        : "Inventory"
                 ) +
                 " | Slot=" +
                 (grantedSlot != null ? grantedSlot.itemSlotID.ToString() : "<none>") +
-                " | Chance=" + recipe.SuccessChance +
                 " | Money=" + recipe.MoneyCost);
         }
 
@@ -11154,122 +11317,6 @@ namespace CraftPeak
             {
                 pendingTempHandDrawGuids.Remove(
                     tempGuid);
-            }
-        }
-
-        private static bool TrySpawnCraftOutputOnGround(
-            global::Player requester,
-            ushort outputId)
-        {
-            if (!PhotonNetwork.IsMasterClient ||
-                requester == null)
-            {
-                return false;
-            }
-
-            Item prefab;
-
-            if (!ItemDatabase.TryGetItem(
-                    outputId,
-                    out prefab) ||
-                prefab == null ||
-                prefab.gameObject == null)
-            {
-                return false;
-            }
-
-            Transform sourceTransform =
-                requester.character != null
-                    ? requester.character.transform
-                    : requester.transform;
-
-            Vector3 forward =
-                sourceTransform != null
-                    ? sourceTransform.forward
-                    : Vector3.forward;
-
-            Vector3 position =
-                sourceTransform != null
-                    ? sourceTransform.position +
-                      forward.normalized *
-                      1.1f +
-                      Vector3.up *
-                      0.35f
-                    : Vector3.zero;
-
-            Quaternion rotation =
-                sourceTransform != null
-                    ? sourceTransform.rotation
-                    : Quaternion.identity;
-
-            try
-            {
-                GameObject spawned =
-                    PhotonNetwork.InstantiateItemRoom(
-                        prefab.gameObject.name,
-                        position,
-                        rotation);
-
-                if (spawned == null)
-                {
-                    return false;
-                }
-
-                Item spawnedItem =
-                    spawned.GetComponent<Item>();
-
-                PhotonView view =
-                    spawned.GetComponent<PhotonView>();
-
-                if (spawnedItem == null ||
-                    view == null)
-                {
-                    PhotonNetwork.Destroy(
-                        spawned);
-
-                    return false;
-                }
-
-                view.RPC(
-                    "SetKinematicRPC",
-                    RpcTarget.All,
-                    false,
-                    position,
-                    rotation);
-
-                if (ModLogger != null)
-                {
-                    ModLogger.LogInfo(
-                        "Craft output spawned on map because inventory and hand were full. " +
-                        "Actor=" +
-                        (
-                            requester.photonView != null &&
-                            requester.photonView.Owner != null
-                                ? requester.photonView.Owner.ActorNumber
-                                : -1
-                        ) +
-                        " | OutputID=" +
-                        outputId +
-                        " | Prefab=" +
-                        prefab.gameObject.name +
-                        " | Position=" +
-                        position);
-                }
-
-                return true;
-            }
-            catch (Exception exception)
-            {
-                if (ModLogger != null)
-                {
-                    ModLogger.LogError(
-                        "Craft output world spawn failed. OutputID=" +
-                        outputId +
-                        " | Error=" +
-                        exception);
-                }
-
-                return false;
             }
         }
 
@@ -12387,7 +12434,7 @@ namespace CraftPeak
                     "Action",
                     detailPanel.transform,
                     font,
-                    "강화 시도",
+                    "강화",
                     new Color(
                         0.82f,
                         0.65f,
@@ -12673,10 +12720,7 @@ namespace CraftPeak
                 recipe.Category +
                 "  |  " +
                 recipe.MoneyCost +
-                "원  |  " +
-                recipe.SuccessChance
-                    .ToString("0") +
-                "%";
+                "원";
         }
 
         private string BuildUpgradeRowText(
@@ -12814,47 +12858,7 @@ namespace CraftPeak
                         .SelectedUpgradeCost);
 
                 builder.Append(
-                    "원\n성공 확률 ");
-
-                builder.Append(
-                    owner
-                        .SelectedUpgradeChance
-                        .ToString("0.#"));
-
-                builder.Append(
-                    "%");
-            }
-
-            builder.Append(
-                "\n\n");
-
-            if (!owner
-                    .UpgradeFailureActive)
-            {
-                builder.Append(
-                    "강화 실패 비활성화");
-            }
-            else
-            {
-                if (kind ==
-                        UpgradeKind.DoubleYield ||
-                    kind ==
-                        UpgradeKind.SellValue)
-                {
-                    builder.Append(
-                        owner
-                            .UpgradeFailureConsumesCost
-                            ? "실패 시 현재 배율 유지 · 다운그레이드 없음 · 비용 소모"
-                            : "실패 시 현재 배율 유지 · 다운그레이드 없음 · 비용 보존");
-                }
-                else
-                {
-                    builder.Append(
-                        owner
-                            .UpgradeFailureConsumesCost
-                            ? "실패 시 단계 유지 · 비용 소모"
-                            : "실패 시 단계 유지 · 비용 보존");
-                }
+                    "원");
             }
 
             return
@@ -12909,16 +12913,6 @@ namespace CraftPeak
 
             builder.Append(
                 requirements);
-
-            builder.Append(
-                "\n\n성공 확률 ");
-
-            builder.Append(
-                recipe.SuccessChance
-                    .ToString("0"));
-
-            builder.Append(
-                "%");
 
             return
                 builder.ToString();
@@ -13837,7 +13831,7 @@ namespace CraftPeak
                             owner.pendingRequest ==
                                 PendingRequest.Upgrade
                                 ? "처리 중..."
-                                : "강화 시도"
+                                : "강화"
                         ));
             }
 
@@ -14019,7 +14013,8 @@ namespace CraftPeak
                     owner.pendingRequest ==
                         PendingRequest.Sell
                         ? "처리 중..."
-                        : "1개 판매");
+                        : owner.selectedSellQuantity +
+                          "개 판매");
             }
 
             private void RefreshDeveloper()
@@ -14496,7 +14491,7 @@ namespace CraftPeak
     /// 기존 Store.cs를 제거해도 Store 참조가 남아 있는 다른 소스가
     /// 컴파일되도록 제공하는 경량 호환 파사드입니다.
     ///
-    /// 제작식, 재료 소비, 성공 판정 및 완성품 지급은 CraftHub가 직접 처리합니다.
+    /// 제작식, 재료 소비 및 완성품 지급은 CraftHub가 직접 처리합니다.
     /// </summary>
     public sealed class Store
     {
@@ -14578,7 +14573,7 @@ namespace CraftPeak
     /// 기존 Upgrade.cs를 제거해도 Upgrade 참조가 남아 있는 다른 소스가
     /// 컴파일되도록 제공하는 경량 호환 파사드입니다.
     ///
-    /// 강화 단계, 확률, 효과 적용 및 Photon 상태 보존은 CraftHub가 직접 처리합니다.
+    /// 강화 단계, 효과 적용 및 Photon 상태 보존은 CraftHub가 직접 처리합니다.
     /// </summary>
     public sealed class Upgrade
     {
@@ -14594,10 +14589,9 @@ namespace CraftPeak
         public enum UpgradeKind
         {
             ResourceGrade = 0,
-            GatherSpeed = 1,
-            StackCapacity = 2,
-            CampfireEfficiency = 3,
-            DoubleYield = 4
+            StackCapacity = 1,
+            CampfireEfficiency = 2,
+            DoubleYield = 3
         }
 
         private static readonly Upgrade FacadeInstance =
@@ -14635,16 +14629,6 @@ namespace CraftPeak
                 return
                     CraftHub
                         .ResourceUpgradeLevel;
-            }
-        }
-
-        public static int GatherUpgradeLevel
-        {
-            get
-            {
-                return
-                    CraftHub
-                        .GatherUpgradeLevel;
             }
         }
 
@@ -14727,18 +14711,6 @@ namespace CraftPeak
             }
         }
 
-        internal float SelectedChance
-        {
-            get
-            {
-                return
-                    CraftHub.Instance != null
-                        ? CraftHub.Instance
-                            .SelectedUpgradeChance
-                        : 0f;
-            }
-        }
-
         internal bool CanAttempt
         {
             get
@@ -14759,28 +14731,6 @@ namespace CraftPeak
                     CraftHub.Instance
                         .IsPending(
                             CraftHub.PendingRequest.Upgrade);
-            }
-        }
-
-        internal bool FailureActive
-        {
-            get
-            {
-                return
-                    CraftHub.Instance != null &&
-                    CraftHub.Instance
-                        .UpgradeFailureActive;
-            }
-        }
-
-        internal bool FailureConsumesCost
-        {
-            get
-            {
-                return
-                    CraftHub.Instance != null &&
-                    CraftHub.Instance
-                        .UpgradeFailureConsumesCost;
             }
         }
 
