@@ -100,7 +100,7 @@ namespace CraftPeak
             "Craft PEAK Inventory Stack";
 
         public const string PluginVersion =
-            "1.6.9";
+            "1.6.18";
 
         private const int DefaultMaximumStackCount = 10;
         private const int MinimumConfigStackCount = 1;
@@ -235,6 +235,9 @@ namespace CraftPeak
         private const byte BackpackStackCountEventCode = 166;
         private const byte BackpackStackSnapshotEventCode = 167;
 
+        private const byte WholeTempStackDropRequestEventCode = 168;
+        private const byte WholeTempStackDropResultEventCode = 169;
+
         private const float PlayerRegistrationRefreshInterval =
             1f;
 
@@ -285,12 +288,37 @@ namespace CraftPeak
         internal struct BackpackWithdrawalState
         {
             public bool IsValid;
+            public bool HandledDirectly;
             public int ActorNumber;
             public byte BackpackSlotIndex;
             public ushort ItemId;
             public int Count;
             public string Guid;
             public BackpackData ActualBackpackData;
+        }
+
+        private struct DroppedWorldStackState
+        {
+            public ushort ItemId;
+            public int Count;
+            public string Guid;
+        }
+
+        internal struct DroppedWorldPickupState
+        {
+            public bool IsValid;
+            public bool IsWholeStack;
+            public int ViewId;
+            public ushort ItemId;
+            public int Count;
+            public global::Player Player;
+            public int CountBefore;
+        }
+
+        internal struct DropItemRpcPatchState
+        {
+            public bool SingleUnitCaptureStarted;
+            public bool WholeTempStackDropStartedFromQ;
         }
 
         // 배낭 RPC 실행 전 전체 수량과 대표 ItemInstanceData 식별값을 예약합니다.
@@ -346,6 +374,40 @@ namespace CraftPeak
 
         // Item.RequestPickup 실행 동안 CraftHub 수집 배율 적용을 차단합니다.
         private static int activeSingleUnitPickupViewId =
+            -1;
+
+        [ThreadStatic]
+        private static int backpackWithdrawalPickupDepth;
+
+        private readonly Dictionary<int, DroppedWorldStackState>
+            droppedWorldStackCounts =
+                new Dictionary<int, DroppedWorldStackState>();
+
+        private static int activeWholeStackPickupViewId =
+            -1;
+
+        private static int activeWholeStackPickupCount;
+
+        private static ushort activeWholeStackPickupItemId;
+
+        private bool localWholeTempStackDropPending;
+
+        private static bool wholeTempStackDropContextActive;
+
+        private static int wholeTempStackDropActorNumber =
+            -1;
+
+        private static byte wholeTempStackDropSlotId =
+            byte.MaxValue;
+
+        private static int wholeTempStackDropCount;
+
+        private static ushort wholeTempStackDropItemId;
+
+        private static string wholeTempStackDropGuid =
+            string.Empty;
+
+        private static int wholeTempStackDropSpawnedViewId =
             -1;
 
         internal static InventoryStack Instance
@@ -1267,12 +1329,27 @@ namespace CraftPeak
             pendingClientMergeCounts.Clear();
 
             singleUnitDroppedItemViewIds.Clear();
+            droppedWorldStackCounts.Clear();
 
             capturingQDropSpawn =
                 false;
 
             activeSingleUnitPickupViewId =
                 -1;
+
+            activeWholeStackPickupViewId =
+                -1;
+
+            activeWholeStackPickupCount =
+                0;
+
+            activeWholeStackPickupItemId =
+                0;
+
+            localWholeTempStackDropPending =
+                false;
+
+            ClearWholeTempStackDropContext();
 
             if (Instance == this)
             {
@@ -1370,12 +1447,27 @@ namespace CraftPeak
             pendingClientMergeCounts.Clear();
 
             singleUnitDroppedItemViewIds.Clear();
+            droppedWorldStackCounts.Clear();
 
             capturingQDropSpawn =
                 false;
 
             activeSingleUnitPickupViewId =
                 -1;
+
+            activeWholeStackPickupViewId =
+                -1;
+
+            activeWholeStackPickupCount =
+                0;
+
+            activeWholeStackPickupItemId =
+                0;
+
+            localWholeTempStackDropPending =
+                false;
+
+            ClearWholeTempStackDropContext();
 
             nextClientMergeRequestId =
                 0;
@@ -2046,6 +2138,81 @@ namespace CraftPeak
             return false;
         }
 
+        private bool TryFindStackWithRequiredSpace(
+            global::Player player,
+            ushort itemId,
+            int requiredSpace,
+            out ItemSlot stackSlot)
+        {
+            stackSlot =
+                null;
+
+            if (player == null ||
+                requiredSpace <= 0 ||
+                !IsStackableItemId(
+                    itemId))
+            {
+                return false;
+            }
+
+            for (int i = 0;
+                 i < player.itemSlots.Length;
+                 i++)
+            {
+                ItemSlot slot =
+                    player.itemSlots[i];
+
+                if (!IsMatchingStack(
+                        slot,
+                        itemId))
+                {
+                    continue;
+                }
+
+                int count =
+                    GetCountInternal(
+                        player,
+                        slot.itemSlotID);
+
+                if (MaximumStackCount -
+                        count <
+                    requiredSpace)
+                {
+                    continue;
+                }
+
+                stackSlot =
+                    slot;
+
+                return true;
+            }
+
+            ItemSlot tempSlot =
+                player.tempFullSlot;
+
+            if (IsMatchingStack(
+                    tempSlot,
+                    itemId))
+            {
+                int tempCount =
+                    GetCountInternal(
+                        player,
+                        tempSlot.itemSlotID);
+
+                if (MaximumStackCount -
+                        tempCount >=
+                    requiredSpace)
+                {
+                    stackSlot =
+                        tempSlot;
+
+                    return true;
+                }
+            }
+
+            return false;
+        }
+
         private static bool IsMatchingStack(
             ItemSlot slot,
             ushort itemId)
@@ -2061,6 +2228,7 @@ namespace CraftPeak
         internal bool ClientTryRequestStackMerge(
             global::Player player,
             ushort itemId,
+            ItemInstanceData instanceData,
             out ItemSlot resultSlot)
         {
             resultSlot =
@@ -2121,11 +2289,17 @@ namespace CraftPeak
                         }
                 };
 
+            int unitsToAdd =
+                GetPickupUnitsToAdd(
+                    itemId,
+                    instanceData);
+
             object[] payload =
             {
                 requestId,
                 (int)itemId,
-                (int)stackSlot.itemSlotID
+                (int)stackSlot.itemSlotID,
+                unitsToAdd
             };
 
             bool sent =
@@ -2285,6 +2459,7 @@ namespace CraftPeak
             int requestId;
             int itemValue;
             int slotValue;
+            int requestedUnits;
 
             try
             {
@@ -2299,6 +2474,13 @@ namespace CraftPeak
                 slotValue =
                     Convert.ToInt32(
                         payload[2]);
+
+                requestedUnits =
+                    payload.Length >
+                        3
+                        ? Convert.ToInt32(
+                            payload[3])
+                        : 1;
             }
             catch (Exception)
             {
@@ -2316,7 +2498,8 @@ namespace CraftPeak
             if (itemValue < 0 ||
                 itemValue > ushort.MaxValue ||
                 slotValue < 0 ||
-                slotValue > byte.MaxValue)
+                slotValue > byte.MaxValue ||
+                requestedUnits <= 0)
             {
                 SendClientMergeResult(
                     senderActorNumber,
@@ -2398,9 +2581,25 @@ namespace CraftPeak
                 return;
             }
 
+            int maximumAllowedUnits =
+                Spawn.IsSaleResourceId(
+                    itemId)
+                    ? Mathf.Max(
+                        1,
+                        CraftHub
+                            .ResourceYieldMultiplier)
+                    : 1;
+
+            int unitsToAdd =
+                Mathf.Clamp(
+                    requestedUnits,
+                    1,
+                    maximumAllowedUnits);
+
             int newCount =
                 Mathf.Clamp(
-                    oldCount + 1,
+                    oldCount +
+                    unitsToAdd,
                     1,
                     MaximumStackCount);
 
@@ -2408,7 +2607,11 @@ namespace CraftPeak
                 player,
                 requestedSlotId,
                 newCount,
-                "ClientPickupMerge");
+                unitsToAdd >
+                    1
+                    ? "ClientPickupMergeYieldX" +
+                      unitsToAdd
+                    : "ClientPickupMerge");
 
             NotifyInventoryChanged(
                 player);
@@ -2435,6 +2638,11 @@ namespace CraftPeak
                     oldCount +
                     "->" +
                     newCount +
+                    " | Added=" +
+                    (
+                        newCount -
+                        oldCount
+                    ) +
                     " | RequestID=" +
                     requestId);
             }
@@ -2604,6 +2812,755 @@ namespace CraftPeak
             }
         }
 
+        internal bool TryRequestWholeTempStackDrop(
+            CharacterItems characterItems,
+            Optionable<byte> requestedSlot)
+        {
+            if (!Enabled ||
+                localWholeTempStackDropPending ||
+                !PhotonNetwork.InRoom ||
+                PhotonNetwork.LocalPlayer == null ||
+                PhotonNetwork.MasterClient == null ||
+                characterItems == null ||
+                requestedSlot.IsNone)
+            {
+                return false;
+            }
+
+            Character character =
+                Character.localCharacter;
+
+            global::Player player =
+                global::Player.localPlayer;
+
+            if (character == null ||
+                player == null ||
+                character.refs == null ||
+                character.refs.items == null ||
+                !ReferenceEquals(
+                    character.refs.items,
+                    characterItems) ||
+                player.itemSlots == null)
+            {
+                return false;
+            }
+
+            byte targetSlotId =
+                requestedSlot.Value;
+
+            if (targetSlotId >=
+                player.itemSlots.Length)
+            {
+                return false;
+            }
+
+            ItemSlot tempSlot =
+                player.tempFullSlot;
+
+            if (tempSlot == null ||
+                tempSlot.IsEmpty() ||
+                tempSlot.prefab == null ||
+                !IsStackableItemId(
+                    tempSlot.prefab.itemID) ||
+                !characterItems
+                    .currentSelectedSlot
+                    .IsSome ||
+                characterItems
+                    .currentSelectedSlot
+                    .Value !=
+                    tempSlot.itemSlotID ||
+                character.data == null ||
+                character.data.currentItem == null)
+            {
+                return false;
+            }
+
+            int count =
+                GetStackCount(
+                    player,
+                    tempSlot.itemSlotID);
+
+            if (count <= 1)
+            {
+                return false;
+            }
+
+            localWholeTempStackDropPending =
+                true;
+
+            if (PhotonNetwork.IsMasterClient)
+            {
+                ProcessWholeTempStackDropRequestOnHost(
+                    PhotonNetwork
+                        .LocalPlayer
+                        .ActorNumber,
+                    targetSlotId);
+
+                return true;
+            }
+
+            RaiseEventOptions options =
+                new RaiseEventOptions
+                {
+                    TargetActors =
+                        new[]
+                        {
+                            PhotonNetwork
+                                .MasterClient
+                                .ActorNumber
+                        }
+                };
+
+            bool sent =
+                PhotonNetwork.RaiseEvent(
+                    WholeTempStackDropRequestEventCode,
+                    new object[]
+                    {
+                        (int)targetSlotId
+                    },
+                    options,
+                    SendOptions.SendReliable);
+
+            if (!sent)
+            {
+                localWholeTempStackDropPending =
+                    false;
+
+                return false;
+            }
+
+            return true;
+        }
+
+        private void ProcessWholeTempStackDropRequestOnHost(
+            int actorNumber,
+            byte targetSlotId)
+        {
+            if (!PhotonNetwork.IsMasterClient)
+            {
+                return;
+            }
+
+            global::Player player =
+                PlayerHandler.GetPlayer(
+                    actorNumber);
+
+            Character character =
+                player != null
+                    ? player.character
+                    : null;
+
+            CharacterItems characterItems =
+                character != null &&
+                character.refs != null
+                    ? character.refs.items
+                    : null;
+
+            if (player == null ||
+                character == null ||
+                characterItems == null ||
+                player.itemSlots == null ||
+                targetSlotId >=
+                    player.itemSlots.Length)
+            {
+                SendWholeTempStackDropResult(
+                    actorNumber,
+                    false,
+                    targetSlotId,
+                    "플레이어 또는 대상 슬롯을 확인하지 못했습니다.");
+
+                return;
+            }
+
+            ItemSlot tempSlot =
+                player.tempFullSlot;
+
+            if (tempSlot == null ||
+                tempSlot.IsEmpty() ||
+                tempSlot.prefab == null ||
+                !IsStackableItemId(
+                    tempSlot.prefab.itemID) ||
+                !characterItems
+                    .currentSelectedSlot
+                    .IsSome ||
+                characterItems
+                    .currentSelectedSlot
+                    .Value !=
+                    tempSlot.itemSlotID ||
+                character.data == null ||
+                character.data.currentItem == null ||
+                !character.data.currentItem.UIData.canDrop)
+            {
+                SendWholeTempStackDropResult(
+                    actorNumber,
+                    false,
+                    targetSlotId,
+                    "가상 손 스택을 전체 드롭할 수 없는 상태입니다.");
+
+                return;
+            }
+
+            int count =
+                GetStackCount(
+                    player,
+                    tempSlot.itemSlotID);
+
+            if (count <= 1)
+            {
+                SendWholeTempStackDropResult(
+                    actorNumber,
+                    false,
+                    targetSlotId,
+                    "가상 손 수량이 2개 미만입니다.");
+
+                return;
+            }
+
+            ushort itemId =
+                tempSlot.prefab.itemID;
+
+            string guid =
+                tempSlot.data != null
+                    ? tempSlot.data.guid
+                        .ToString()
+                    : string.Empty;
+
+            Item heldItem =
+                character.data.currentItem;
+
+            Vector3 spawnPosition =
+                heldItem.transform.position +
+                Vector3.down *
+                0.2f;
+
+            Vector3 velocity =
+                heldItem.rig != null
+                    ? heldItem.rig.linearVelocity
+                    : Vector3.zero;
+
+            Quaternion rotation =
+                heldItem.transform.rotation;
+
+            wholeTempStackDropContextActive =
+                true;
+
+            wholeTempStackDropActorNumber =
+                actorNumber;
+
+            wholeTempStackDropSlotId =
+                tempSlot.itemSlotID;
+
+            wholeTempStackDropCount =
+                count;
+
+            wholeTempStackDropItemId =
+                itemId;
+
+            wholeTempStackDropGuid =
+                guid;
+
+            wholeTempStackDropSpawnedViewId =
+                -1;
+
+            try
+            {
+                characterItems.photonView.RPC(
+                    "DropItemRpc",
+                    RpcTarget.All,
+                    new object[]
+                    {
+                        0f,
+                        tempSlot.itemSlotID,
+                        spawnPosition,
+                        velocity,
+                        rotation,
+                        tempSlot.data,
+                        false
+                    });
+            }
+            catch (Exception exception)
+            {
+                Logger.LogError(
+                    "Whole temp stack drop RPC failed. " +
+                    exception);
+
+                ClearWholeTempStackDropContext();
+
+                SendWholeTempStackDropResult(
+                    actorNumber,
+                    false,
+                    targetSlotId,
+                    "가상 손 전체 드롭 RPC가 실패했습니다.");
+
+                return;
+            }
+
+            int spawnedViewId =
+                wholeTempStackDropSpawnedViewId;
+
+            bool slotCleared =
+                player.tempFullSlot == null ||
+                player.tempFullSlot.IsEmpty();
+
+            ClearWholeTempStackDropContext();
+
+            bool success =
+                spawnedViewId >
+                    0 &&
+                slotCleared;
+
+            SendWholeTempStackDropResult(
+                actorNumber,
+                success,
+                targetSlotId,
+                success
+                    ? string.Empty
+                    : "가상 손 전체 드롭 결과를 확인하지 못했습니다.");
+
+            if (success)
+            {
+                Logger.LogInfo(
+                    "Whole temp stack dropped as one world item. " +
+                    "Actor=" +
+                    actorNumber +
+                    " | ItemID=" +
+                    itemId +
+                    " | Count=" +
+                    count +
+                    " | ViewID=" +
+                    spawnedViewId +
+                    " | TargetSlot=" +
+                    targetSlotId);
+            }
+        }
+
+        private void SendWholeTempStackDropResult(
+            int actorNumber,
+            bool success,
+            byte targetSlotId,
+            string message)
+        {
+            if (actorNumber <= 0)
+            {
+                return;
+            }
+
+            if (PhotonNetwork.LocalPlayer != null &&
+                actorNumber ==
+                    PhotonNetwork
+                        .LocalPlayer
+                        .ActorNumber)
+            {
+                ApplyWholeTempStackDropResult(
+                    success,
+                    targetSlotId,
+                    message);
+
+                return;
+            }
+
+            PhotonNetwork.RaiseEvent(
+                WholeTempStackDropResultEventCode,
+                new object[]
+                {
+                    success,
+                    (int)targetSlotId,
+                    message ??
+                    string.Empty
+                },
+                new RaiseEventOptions
+                {
+                    TargetActors =
+                        new[]
+                        {
+                            actorNumber
+                        }
+                },
+                SendOptions.SendReliable);
+        }
+
+        private void ApplyWholeTempStackDropResult(
+            bool success,
+            byte targetSlotId,
+            string message)
+        {
+            localWholeTempStackDropPending =
+                false;
+
+            if (!success)
+            {
+                Logger.LogWarning(
+                    "Whole temp stack drop rejected. " +
+                    (
+                        message ??
+                        string.Empty
+                    ));
+
+                return;
+            }
+
+            StartCoroutine(
+                EquipRegularSlotAfterWholeTempDrop(
+                    targetSlotId));
+        }
+
+        private IEnumerator
+            EquipRegularSlotAfterWholeTempDrop(
+                byte targetSlotId)
+        {
+            yield return null;
+
+            Character character =
+                Character.localCharacter;
+
+            global::Player player =
+                global::Player.localPlayer;
+
+            if (character == null ||
+                player == null ||
+                character.refs == null ||
+                character.refs.items == null ||
+                player.itemSlots == null ||
+                targetSlotId >=
+                    player.itemSlots.Length)
+            {
+                yield break;
+            }
+
+            character.refs.items
+                .EquipSlot(
+                    Optionable<byte>.Some(
+                        targetSlotId));
+        }
+
+        internal static bool IsWholeTempStackDropFor(
+            global::Player player,
+            byte slotId)
+        {
+            return
+                wholeTempStackDropContextActive &&
+                player != null &&
+                player.photonView != null &&
+                player.photonView.Owner !=
+                    null &&
+                player.photonView
+                    .Owner
+                    .ActorNumber ==
+                    wholeTempStackDropActorNumber &&
+                slotId ==
+                    wholeTempStackDropSlotId;
+        }
+
+        internal static bool IsWholeTempStackDropFor(
+            CharacterItems characterItems,
+            byte slotId)
+        {
+            if (!wholeTempStackDropContextActive ||
+                characterItems == null ||
+                characterItems.photonView == null ||
+                characterItems.photonView.Owner ==
+                    null)
+            {
+                return false;
+            }
+
+            return
+                characterItems.photonView
+                    .Owner
+                    .ActorNumber ==
+                    wholeTempStackDropActorNumber &&
+                slotId ==
+                    wholeTempStackDropSlotId;
+        }
+
+        internal static bool IsWholeTempStackDropSlot(
+            ItemSlot slot)
+        {
+            if (!wholeTempStackDropContextActive ||
+                slot == null)
+            {
+                return false;
+            }
+
+            global::Player player =
+                PlayerHandler.GetPlayer(
+                    wholeTempStackDropActorNumber);
+
+            if (player == null)
+            {
+                return false;
+            }
+
+            return
+                ReferenceEquals(
+                    player.GetItemSlot(
+                        wholeTempStackDropSlotId),
+                    slot);
+        }
+
+        private static void ClearWholeTempStackDropContext()
+        {
+            wholeTempStackDropContextActive =
+                false;
+
+            wholeTempStackDropActorNumber =
+                -1;
+
+            wholeTempStackDropSlotId =
+                byte.MaxValue;
+
+            wholeTempStackDropCount =
+                0;
+
+            wholeTempStackDropItemId =
+                0;
+
+            wholeTempStackDropGuid =
+                string.Empty;
+
+            wholeTempStackDropSpawnedViewId =
+                -1;
+        }
+
+        private static bool TryRegisterWholeTempStackWorldItem(
+            GameObject spawnedObject)
+        {
+            if (!wholeTempStackDropContextActive ||
+                !PhotonNetwork.IsMasterClient ||
+                Instance == null ||
+                spawnedObject == null ||
+                wholeTempStackDropCount <=
+                    1)
+            {
+                return false;
+            }
+
+            PhotonView view =
+                spawnedObject.GetComponent<
+                    PhotonView>();
+
+            Item item =
+                spawnedObject.GetComponent<
+                    Item>();
+
+            if (view == null ||
+                view.ViewID <= 0 ||
+                item == null ||
+                item.itemID !=
+                    wholeTempStackDropItemId)
+            {
+                return false;
+            }
+
+            Instance.droppedWorldStackCounts[
+                view.ViewID] =
+                    new DroppedWorldStackState
+                    {
+                        ItemId =
+                            wholeTempStackDropItemId,
+
+                        Count =
+                            wholeTempStackDropCount,
+
+                        Guid =
+                            wholeTempStackDropGuid
+                    };
+
+            wholeTempStackDropSpawnedViewId =
+                view.ViewID;
+
+            return true;
+        }
+
+        internal static bool TryBeginWholeTempStackDropFromQ(
+            CharacterItems characterItems,
+            byte slotId)
+        {
+            if (!Enabled ||
+                !PhotonNetwork.IsMasterClient ||
+                Instance == null ||
+                wholeTempStackDropContextActive ||
+                characterItems == null ||
+                characterItems.photonView == null ||
+                characterItems.photonView.Owner ==
+                    null)
+            {
+                return false;
+            }
+
+            int actorNumber =
+                characterItems.photonView
+                    .Owner
+                    .ActorNumber;
+
+            global::Player player =
+                PlayerHandler.GetPlayer(
+                    actorNumber);
+
+            Character character =
+                player != null
+                    ? player.character
+                    : null;
+
+            if (player == null ||
+                character == null ||
+                character.refs == null ||
+                character.refs.items == null ||
+                !ReferenceEquals(
+                    character.refs.items,
+                    characterItems) ||
+                character.data == null ||
+                character.data.currentItem == null ||
+                !character.data.currentItem.UIData.canDrop)
+            {
+                return false;
+            }
+
+            ItemSlot tempSlot =
+                player.tempFullSlot;
+
+            if (tempSlot == null ||
+                tempSlot.IsEmpty() ||
+                tempSlot.prefab == null ||
+                !IsStackableItemId(
+                    tempSlot.prefab.itemID) ||
+                tempSlot.itemSlotID !=
+                    slotId ||
+                !characterItems
+                    .currentSelectedSlot
+                    .IsSome ||
+                characterItems
+                    .currentSelectedSlot
+                    .Value !=
+                    slotId)
+            {
+                return false;
+            }
+
+            int count =
+                GetStackCount(
+                    player,
+                    slotId);
+
+            if (count <= 1)
+            {
+                return false;
+            }
+
+            wholeTempStackDropContextActive =
+                true;
+
+            wholeTempStackDropActorNumber =
+                actorNumber;
+
+            wholeTempStackDropSlotId =
+                slotId;
+
+            wholeTempStackDropCount =
+                count;
+
+            wholeTempStackDropItemId =
+                tempSlot.prefab.itemID;
+
+            wholeTempStackDropGuid =
+                tempSlot.data != null
+                    ? tempSlot.data.guid
+                        .ToString()
+                    : string.Empty;
+
+            wholeTempStackDropSpawnedViewId =
+                -1;
+
+            if (ModLogger != null)
+            {
+                ModLogger.LogInfo(
+                    "Q whole temp stack drop started. " +
+                    "Actor=" +
+                    actorNumber +
+                    " | Slot=" +
+                    slotId +
+                    " | ItemID=" +
+                    wholeTempStackDropItemId +
+                    " | Count=" +
+                    count);
+            }
+
+            return true;
+        }
+
+        internal static void CompleteWholeTempStackDropFromQ(
+            bool startedFromQ,
+            string completionReason)
+        {
+            if (!startedFromQ)
+            {
+                return;
+            }
+
+            int actorNumber =
+                wholeTempStackDropActorNumber;
+
+            byte slotId =
+                wholeTempStackDropSlotId;
+
+            ushort itemId =
+                wholeTempStackDropItemId;
+
+            int count =
+                wholeTempStackDropCount;
+
+            int spawnedViewId =
+                wholeTempStackDropSpawnedViewId;
+
+            bool registered =
+                Instance != null &&
+                spawnedViewId >
+                    0 &&
+                Instance.droppedWorldStackCounts
+                    .ContainsKey(
+                        spawnedViewId);
+
+            if (ModLogger != null)
+            {
+                if (registered)
+                {
+                    ModLogger.LogInfo(
+                        "Q whole temp stack dropped as one world item. " +
+                        "Actor=" +
+                        actorNumber +
+                        " | Slot=" +
+                        slotId +
+                        " | ItemID=" +
+                        itemId +
+                        " | Count=" +
+                        count +
+                        " | ViewID=" +
+                        spawnedViewId +
+                        " | Completion=" +
+                        completionReason);
+                }
+                else
+                {
+                    ModLogger.LogWarning(
+                        "Q whole temp stack drop did not register a world stack. " +
+                        "Actor=" +
+                        actorNumber +
+                        " | Slot=" +
+                        slotId +
+                        " | ItemID=" +
+                        itemId +
+                        " | Count=" +
+                        count +
+                        " | ViewID=" +
+                        spawnedViewId +
+                        " | Completion=" +
+                        completionReason);
+                }
+            }
+
+            ClearWholeTempStackDropContext();
+        }
+
         internal static void BeginQDropSpawnCapture()
         {
             if (!Enabled ||
@@ -2625,6 +3582,12 @@ namespace CraftPeak
         internal static void RegisterQDroppedWorldItem(
             GameObject spawnedObject)
         {
+            if (TryRegisterWholeTempStackWorldItem(
+                    spawnedObject))
+            {
+                return;
+            }
+
             if (!capturingQDropSpawn ||
                 !PhotonNetwork.IsMasterClient ||
                 spawnedObject == null)
@@ -2663,11 +3626,26 @@ namespace CraftPeak
             }
         }
 
-        internal static bool BeginSingleUnitPickup(
-            Item item)
+        internal static void BeginDroppedWorldPickup(
+            Item item,
+            PhotonView characterView,
+            out DroppedWorldPickupState state)
         {
+            state =
+                default(
+                    DroppedWorldPickupState);
+
             activeSingleUnitPickupViewId =
                 -1;
+
+            activeWholeStackPickupViewId =
+                -1;
+
+            activeWholeStackPickupCount =
+                0;
+
+            activeWholeStackPickupItemId =
+                0;
 
             if (!Enabled ||
                 !PhotonNetwork.IsMasterClient ||
@@ -2675,28 +3653,300 @@ namespace CraftPeak
                 item.photonView == null ||
                 item.photonView.ViewID <= 0)
             {
-                return false;
+                return;
             }
 
             int viewId =
                 item.photonView.ViewID;
 
-            if (!singleUnitDroppedItemViewIds.Contains(
-                    viewId))
+            DroppedWorldStackState droppedState;
+
+            if (Instance != null &&
+                Instance.droppedWorldStackCounts
+                    .TryGetValue(
+                        viewId,
+                        out droppedState) &&
+                droppedState.Count >
+                    0 &&
+                droppedState.ItemId ==
+                    item.itemID)
             {
-                return false;
+                string itemGuid =
+                    item.data != null
+                        ? item.data.guid
+                            .ToString()
+                        : string.Empty;
+
+                if (!string.IsNullOrEmpty(
+                        droppedState.Guid) &&
+                    !string.Equals(
+                        droppedState.Guid,
+                        itemGuid,
+                        StringComparison.Ordinal))
+                {
+                    return;
+                }
+
+                Character character =
+                    characterView != null
+                        ? characterView
+                            .GetComponent<Character>()
+                        : null;
+
+                global::Player player =
+                    character != null
+                        ? character.player
+                        : null;
+
+                if (player == null)
+                {
+                    return;
+                }
+
+                activeWholeStackPickupViewId =
+                    viewId;
+
+                activeWholeStackPickupCount =
+                    droppedState.Count;
+
+                activeWholeStackPickupItemId =
+                    droppedState.ItemId;
+
+                state.IsValid =
+                    true;
+
+                state.IsWholeStack =
+                    true;
+
+                state.ViewId =
+                    viewId;
+
+                state.ItemId =
+                    droppedState.ItemId;
+
+                state.Count =
+                    droppedState.Count;
+
+                state.Player =
+                    player;
+
+                state.CountBefore =
+                    CountPlayerItemUnits(
+                        player,
+                        droppedState.ItemId);
+
+                return;
             }
 
-            activeSingleUnitPickupViewId =
-                viewId;
+            if (singleUnitDroppedItemViewIds
+                    .Contains(
+                        viewId))
+            {
+                activeSingleUnitPickupViewId =
+                    viewId;
 
-            return true;
+                state.IsValid =
+                    true;
+
+                state.ViewId =
+                    viewId;
+
+                state.ItemId =
+                    item.itemID;
+            }
         }
 
-        internal static void EndSingleUnitPickup()
+        internal static void CompleteDroppedWorldPickup(
+            DroppedWorldPickupState state)
+        {
+            if (state.IsValid &&
+                state.IsWholeStack &&
+                Instance != null &&
+                state.Player != null)
+            {
+                int countAfter =
+                    CountPlayerItemUnits(
+                        state.Player,
+                        state.ItemId);
+
+                if (countAfter >=
+                    state.CountBefore +
+                    state.Count)
+                {
+                    Instance
+                        .droppedWorldStackCounts
+                        .Remove(
+                            state.ViewId);
+
+                    if (ModLogger != null)
+                    {
+                        ModLogger.LogInfo(
+                            "Whole temp stack picked up. " +
+                            "ViewID=" +
+                            state.ViewId +
+                            " | ItemID=" +
+                            state.ItemId +
+                            " | Count=" +
+                            state.Count +
+                            " | Inventory=" +
+                            state.CountBefore +
+                            "->" +
+                            countAfter);
+                    }
+                }
+            }
+
+            EndDroppedWorldPickup();
+        }
+
+        internal static void EndDroppedWorldPickup()
         {
             activeSingleUnitPickupViewId =
                 -1;
+
+            activeWholeStackPickupViewId =
+                -1;
+
+            activeWholeStackPickupCount =
+                0;
+
+            activeWholeStackPickupItemId =
+                0;
+        }
+
+        private static int CountPlayerItemUnits(
+            global::Player player,
+            ushort itemId)
+        {
+            if (player == null)
+            {
+                return 0;
+            }
+
+            int total =
+                0;
+
+            if (player.itemSlots != null)
+            {
+                for (int i = 0;
+                     i < player.itemSlots.Length;
+                     i++)
+                {
+                    ItemSlot slot =
+                        player.itemSlots[i];
+
+                    if (!IsMatchingStack(
+                            slot,
+                            itemId))
+                    {
+                        continue;
+                    }
+
+                    total +=
+                        Mathf.Max(
+                            1,
+                            GetStackCount(
+                                player,
+                                slot.itemSlotID));
+                }
+            }
+
+            ItemSlot tempSlot =
+                player.tempFullSlot;
+
+            if (IsMatchingStack(
+                    tempSlot,
+                    itemId))
+            {
+                total +=
+                    Mathf.Max(
+                        1,
+                        GetStackCount(
+                            player,
+                            tempSlot.itemSlotID));
+            }
+
+            return total;
+        }
+
+        internal static bool IsWholeStackPickupActive()
+        {
+            return
+                activeWholeStackPickupViewId >
+                    0 &&
+                activeWholeStackPickupCount >
+                    0;
+        }
+
+        internal static bool IsWholeStackPickupActiveForItem(
+            ushort itemId)
+        {
+            return
+                IsWholeStackPickupActive() &&
+                activeWholeStackPickupItemId ==
+                    itemId;
+        }
+
+        internal static void BeginBackpackWithdrawalPickup()
+        {
+            backpackWithdrawalPickupDepth++;
+        }
+
+        internal static void EndBackpackWithdrawalPickup()
+        {
+            backpackWithdrawalPickupDepth =
+                Mathf.Max(
+                    0,
+                    backpackWithdrawalPickupDepth -
+                    1);
+        }
+
+        internal static bool IsBackpackWithdrawalPickupActive()
+        {
+            return
+                backpackWithdrawalPickupDepth >
+                0;
+        }
+
+        internal static bool IsSingleUnitPickupBonusBlocked()
+        {
+            int viewId =
+                activeSingleUnitPickupViewId;
+
+            return
+                viewId > 0 &&
+                singleUnitDroppedItemViewIds.Contains(
+                    viewId);
+        }
+
+        internal static int GetPickupUnitsToAdd(
+            ushort itemId,
+            ItemInstanceData instanceData)
+        {
+            if (IsWholeStackPickupActiveForItem(
+                    itemId))
+            {
+                return
+                    Mathf.Clamp(
+                        activeWholeStackPickupCount,
+                        1,
+                        MaximumStackCount);
+            }
+
+            if (instanceData == null ||
+                !Spawn.IsSaleResourceId(
+                    itemId) ||
+                IsBackpackWithdrawalPickupActive() ||
+                IsSingleUnitPickupBonusBlocked())
+            {
+                return 1;
+            }
+
+            return
+                Mathf.Max(
+                    1,
+                    CraftHub
+                        .ResourceYieldMultiplier);
         }
 
         internal static bool ConsumeSingleUnitPickupBonusBlock()
@@ -2725,6 +3975,7 @@ namespace CraftPeak
         internal bool HostTryAddToExistingStack(
             global::Player player,
             ushort itemId,
+            ItemInstanceData instanceData,
             out ItemSlot resultSlot)
         {
             resultSlot =
@@ -2740,12 +3991,27 @@ namespace CraftPeak
                 return false;
             }
 
+            int unitsToAdd =
+                GetPickupUnitsToAdd(
+                    itemId,
+                    instanceData);
+
             ItemSlot stackSlot;
 
-            if (!TryFindStackWithSpace(
-                    player,
-                    itemId,
-                    out stackSlot))
+            bool foundStack =
+                IsWholeStackPickupActiveForItem(
+                    itemId)
+                    ? TryFindStackWithRequiredSpace(
+                        player,
+                        itemId,
+                        unitsToAdd,
+                        out stackSlot)
+                    : TryFindStackWithSpace(
+                        player,
+                        itemId,
+                        out stackSlot);
+
+            if (!foundStack)
             {
                 return false;
             }
@@ -2757,7 +4023,8 @@ namespace CraftPeak
 
             int newCount =
                 Mathf.Clamp(
-                    oldCount + 1,
+                    oldCount +
+                    unitsToAdd,
                     1,
                     MaximumStackCount);
 
@@ -2765,7 +4032,11 @@ namespace CraftPeak
                 player,
                 stackSlot.itemSlotID,
                 newCount,
-                "PickupMerge");
+                unitsToAdd >
+                    1
+                    ? "PickupMergeYieldX" +
+                      unitsToAdd
+                    : "PickupMerge");
 
             resultSlot =
                 stackSlot;
@@ -2784,7 +4055,12 @@ namespace CraftPeak
                 " | Count=" +
                 oldCount +
                 "->" +
-                newCount);
+                newCount +
+                " | Added=" +
+                (
+                    newCount -
+                    oldCount
+                ));
 
             return true;
         }
@@ -2792,7 +4068,8 @@ namespace CraftPeak
         internal void HostRegisterNewSlot(
             global::Player player,
             ItemSlot slot,
-            ushort itemId)
+            ushort itemId,
+            ItemInstanceData instanceData)
         {
             if (!Enabled ||
                 !PhotonNetwork.IsMasterClient ||
@@ -2804,11 +4081,23 @@ namespace CraftPeak
                 return;
             }
 
+            int initialCount =
+                Mathf.Clamp(
+                    GetPickupUnitsToAdd(
+                        itemId,
+                        instanceData),
+                    1,
+                    MaximumStackCount);
+
             SetCountOnHost(
                 player,
                 slot.itemSlotID,
-                1,
-                "NewStack");
+                initialCount,
+                initialCount >
+                    1
+                    ? "NewStackYieldX" +
+                      initialCount
+                    : "NewStack");
 
             NotifyInventoryChanged(
                 player);
@@ -3113,6 +4402,100 @@ namespace CraftPeak
         {
             if (photonEvent == null)
             {
+                return;
+            }
+
+            if (photonEvent.Code ==
+                WholeTempStackDropRequestEventCode)
+            {
+                if (PhotonNetwork.IsMasterClient)
+                {
+                    object[] payload =
+                        photonEvent.CustomData as
+                            object[];
+
+                    if (payload != null &&
+                        payload.Length >
+                            0)
+                    {
+                        try
+                        {
+                            int targetValue =
+                                Convert.ToInt32(
+                                    payload[0]);
+
+                            if (targetValue >=
+                                    0 &&
+                                targetValue <=
+                                    byte.MaxValue)
+                            {
+                                ProcessWholeTempStackDropRequestOnHost(
+                                    photonEvent.Sender,
+                                    (byte)targetValue);
+                            }
+                        }
+                        catch (Exception)
+                        {
+                        }
+                    }
+                }
+
+                return;
+            }
+
+            if (photonEvent.Code ==
+                WholeTempStackDropResultEventCode)
+            {
+                if (PhotonNetwork.MasterClient !=
+                        null &&
+                    photonEvent.Sender !=
+                        PhotonNetwork
+                            .MasterClient
+                            .ActorNumber)
+                {
+                    return;
+                }
+
+                object[] payload =
+                    photonEvent.CustomData as
+                        object[];
+
+                if (payload == null ||
+                    payload.Length <
+                        3)
+                {
+                    return;
+                }
+
+                try
+                {
+                    bool success =
+                        Convert.ToBoolean(
+                            payload[0]);
+
+                    int targetValue =
+                        Convert.ToInt32(
+                            payload[1]);
+
+                    string message =
+                        payload[2] as string ??
+                        string.Empty;
+
+                    if (targetValue >=
+                            0 &&
+                        targetValue <=
+                            byte.MaxValue)
+                    {
+                        ApplyWholeTempStackDropResult(
+                            success,
+                            (byte)targetValue,
+                            message);
+                    }
+                }
+                catch (Exception)
+                {
+                }
+
                 return;
             }
 
@@ -5587,6 +6970,7 @@ namespace CraftPeak
                         .HostTryAddToExistingStack(
                             __instance,
                             itemID,
+                            instanceData,
                             out mergedSlot);
 
                 if (!hostMerged)
@@ -5618,6 +7002,7 @@ namespace CraftPeak
                     .ClientTryRequestStackMerge(
                         __instance,
                         itemID,
+                        instanceData,
                         out mergedSlot);
 
             if (!requestSent)
@@ -5677,7 +7062,8 @@ namespace CraftPeak
                 .HostRegisterNewSlot(
                     __instance,
                     __2,
-                    itemID);
+                    itemID,
+                    instanceData);
 
         }
 
@@ -5795,6 +7181,34 @@ namespace CraftPeak
                 InventoryStack.BuildHandStateSummary(
                     __instance,
                     Character.localCharacter));
+        }
+    }
+
+    [HarmonyPatch(
+        typeof(CharacterItems),
+        "EquipSlot")]
+    internal static class
+        InventoryWholeTempStackSwitchDropPatch
+    {
+        [HarmonyPrefix]
+        [HarmonyPriority(Priority.First)]
+        private static bool Prefix(
+            CharacterItems __instance,
+            Optionable<byte> slotID)
+        {
+            if (InventoryStack.Instance == null)
+            {
+                return true;
+            }
+
+            bool handled =
+                InventoryStack.Instance
+                    .TryRequestWholeTempStackDrop(
+                        __instance,
+                        slotID);
+
+            return
+                !handled;
         }
     }
 
@@ -5945,6 +7359,25 @@ namespace CraftPeak
 
             byte slotId =
                 slot.Value;
+
+            if (InventoryStack
+                    .IsWholeTempStackDropFor(
+                        __instance,
+                        slotId))
+            {
+                InventoryStack.Instance
+                    .HostRemoveFinalStackEntry(
+                        __instance,
+                        slotId,
+                        "WholeTempStackDrop");
+
+                InventoryStack.Instance
+                    .MarkExpectedRemoteRemove(
+                        __instance,
+                        slotId);
+
+                return true;
+            }
 
             ItemSlot itemSlot =
                 __instance.GetItemSlot(
@@ -6115,6 +7548,13 @@ namespace CraftPeak
         private static bool Prefix(
             ItemSlot __instance)
         {
+            if (InventoryStack
+                    .IsWholeTempStackDropSlot(
+                        __instance))
+            {
+                return true;
+            }
+
             if (InventoryStack.Instance == null ||
                 !InventoryStack.IsGameplayActive() ||
                 !PhotonNetwork.IsMasterClient ||
@@ -6247,8 +7687,16 @@ namespace CraftPeak
         [HarmonyPrefix]
         [HarmonyPriority(Priority.First)]
         private static void Prefix(
-            object[] __args)
+            CharacterItems __instance,
+            byte slotID,
+            object[] __args,
+            out InventoryStack.DropItemRpcPatchState
+                __state)
         {
+            __state =
+                default(
+                    InventoryStack.DropItemRpcPatchState);
+
             if (InventoryStack.Instance != null)
             {
                 InventoryStack.Instance.WriteHandDiagnostic(
@@ -6262,16 +7710,45 @@ namespace CraftPeak
                         Character.localCharacter));
             }
 
-            InventoryStack
-                .BeginQDropSpawnCapture();
+            __state.WholeTempStackDropStartedFromQ =
+                InventoryStack
+                    .TryBeginWholeTempStackDropFromQ(
+                        __instance,
+                        slotID);
+
+            bool wholeStackDropActive =
+                InventoryStack
+                    .IsWholeTempStackDropFor(
+                        __instance,
+                        slotID);
+
+            __state.SingleUnitCaptureStarted =
+                !wholeStackDropActive;
+
+            if (__state.SingleUnitCaptureStarted)
+            {
+                InventoryStack
+                    .BeginQDropSpawnCapture();
+            }
         }
 
         [HarmonyPostfix]
         [HarmonyPriority(Priority.Last)]
-        private static void Postfix()
+        private static void Postfix(
+            InventoryStack.DropItemRpcPatchState
+                __state)
         {
+            if (__state.SingleUnitCaptureStarted)
+            {
+                InventoryStack
+                    .EndQDropSpawnCapture();
+            }
+
             InventoryStack
-                .EndQDropSpawnCapture();
+                .CompleteWholeTempStackDropFromQ(
+                    __state
+                        .WholeTempStackDropStartedFromQ,
+                    "Postfix");
 
             if (InventoryStack.Instance != null)
             {
@@ -6285,21 +7762,34 @@ namespace CraftPeak
 
         [HarmonyFinalizer]
         private static Exception Finalizer(
-            Exception __exception)
+            Exception __exception,
+            InventoryStack.DropItemRpcPatchState
+                __state)
         {
-            InventoryStack
-                .EndQDropSpawnCapture();
-
-            if (__exception != null &&
-                InventoryStack.Instance != null)
+            if (__state.SingleUnitCaptureStarted)
             {
-                InventoryStack.Instance.WriteHandDiagnostic(
-                    "DROP-ITEM-RPC-EXCEPTION",
-                    __exception.ToString() +
-                    " | " +
-                    InventoryStack.BuildHandStateSummary(
-                        global::Player.localPlayer,
-                        Character.localCharacter));
+                InventoryStack
+                    .EndQDropSpawnCapture();
+            }
+
+            if (__exception != null)
+            {
+                InventoryStack
+                    .CompleteWholeTempStackDropFromQ(
+                        __state
+                            .WholeTempStackDropStartedFromQ,
+                        "Exception");
+
+                if (InventoryStack.Instance != null)
+                {
+                    InventoryStack.Instance.WriteHandDiagnostic(
+                        "DROP-ITEM-RPC-EXCEPTION",
+                        __exception.ToString() +
+                        " | " +
+                        InventoryStack.BuildHandStateSummary(
+                            global::Player.localPlayer,
+                            Character.localCharacter));
+                }
             }
 
             return __exception;
@@ -6343,19 +7833,27 @@ namespace CraftPeak
         [HarmonyPrefix]
         [HarmonyPriority(Priority.First)]
         private static void Prefix(
-            Item __instance)
+            Item __instance,
+            PhotonView characterView,
+            out InventoryStack.DroppedWorldPickupState
+                __state)
         {
             InventoryStack
-                .BeginSingleUnitPickup(
-                    __instance);
+                .BeginDroppedWorldPickup(
+                    __instance,
+                    characterView,
+                    out __state);
         }
 
         [HarmonyPostfix]
         [HarmonyPriority(Priority.Last)]
-        private static void Postfix()
+        private static void Postfix(
+            InventoryStack.DroppedWorldPickupState
+                __state)
         {
             InventoryStack
-                .EndSingleUnitPickup();
+                .CompleteDroppedWorldPickup(
+                    __state);
         }
 
         [HarmonyFinalizer]
@@ -6363,7 +7861,7 @@ namespace CraftPeak
             Exception __exception)
         {
             InventoryStack
-                .EndSingleUnitPickup();
+                .EndDroppedWorldPickup();
 
             return __exception;
         }
@@ -6383,6 +7881,14 @@ namespace CraftPeak
         [HarmonyPriority(Priority.First)]
         private static bool Prefix()
         {
+            if (InventoryStack
+                    .IsBackpackWithdrawalPickupActive() ||
+                InventoryStack
+                    .IsWholeStackPickupActive())
+            {
+                return false;
+            }
+
             return
                 !InventoryStack
                     .ConsumeSingleUnitPickupBonusBlock();
@@ -6426,6 +7932,9 @@ namespace CraftPeak
                 return true;
             }
 
+            InventoryStack
+                .BeginBackpackWithdrawalPickup();
+
             bool handledDirectly =
                 InventoryStack.Instance
                     .TryHandleBackpackWithdrawalIntoExistingStack(
@@ -6438,11 +7947,8 @@ namespace CraftPeak
                 return true;
             }
 
-            // 원본 RequestPickup을 건너뛰었으므로 Postfix의 일반 복원 경로가
-            // 다시 실행되지 않도록 상태를 비웁니다.
-            __state =
-                default(
-                    InventoryStack.BackpackWithdrawalState);
+            __state.HandledDirectly =
+                true;
 
             return false;
         }
@@ -6454,7 +7960,8 @@ namespace CraftPeak
             InventoryStack.BackpackWithdrawalState __state)
         {
             if (InventoryStack.Instance == null ||
-                !__state.IsValid)
+                !__state.IsValid ||
+                __state.HandledDirectly)
             {
                 return;
             }
@@ -6463,6 +7970,20 @@ namespace CraftPeak
                 .CompleteBackpackWithdrawal(
                     characterView,
                     __state);
+        }
+
+        [HarmonyFinalizer]
+        private static Exception Finalizer(
+            Exception __exception,
+            InventoryStack.BackpackWithdrawalState __state)
+        {
+            if (__state.IsValid)
+            {
+                InventoryStack
+                    .EndBackpackWithdrawalPickup();
+            }
+
+            return __exception;
         }
     }
 
