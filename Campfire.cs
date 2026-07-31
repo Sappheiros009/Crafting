@@ -1,38 +1,50 @@
-// CAMPFIRE MATERIAL GATE + MODCONFIG BUILD 1.1.1
+// CampfireGate는 MapHandler.CurrentCampfire로 지정된 꺼진 모닥불의 점화 요청을
+// 마스터 클라이언트에서 검증하고, 설정된 재료를 파티 인벤토리에서 소비한 뒤 점화합니다.
 //
-// 기능
-// - 일반 모닥불 점화 조건은 ModConfig에서 조절할 수 있습니다.
-//     나뭇가지  ItemID 28
-//     돌        ItemID 72
-//     횃불      ItemID 109
-// - 횃불은 맵 자원으로 추가하지 않습니다. 상점에서만 지급하는 전제를 유지합니다.
-// - 재료는 상호작용한 플레이어 한 명의 인벤토리에 몰려 있을 필요가 없습니다.
-// - 접속 중인 모든 플레이어의 다음 저장 위치를 합산합니다.
-//     일반 인벤토리 슬롯
-//     임시 슬롯
-//     착용한 배낭 내부 슬롯
-// - 호스트가 ModConfig 요구 수량을 검증하고 필요한 개수만큼 소비합니다.
-// - 재료 소비가 성공한 경우에만 PEAK 원본 Light_Rpc를 실행합니다.
-// - 기존 "모든 생존 플레이어가 모닥불 근처에 있어야 한다"는 조건을 유지합니다.
-// - 이미 켜진 모닥불의 요리 기능은 변경하지 않습니다.
-// - 최종 Pyre는 건드리지 않습니다.
-// - Airport, Title, Pretitle에서는 작동하지 않습니다.
-// - 제작 등급은 요구 등급 이상이면 통과합니다.
-//   Common 조건: Common/Normal/Rare/Unique/Legendary 모두 허용
-//   Normal 조건: Normal/Rare/Unique/Legendary 모두 허용
-// - Photon 예약 이벤트 코드 충돌을 제거하여 로컬 클라이언트 점화 요청을 정상 전달합니다.
-// - 점화 요청 단계별 진단 로그를 출력합니다.
-// - 현재 PEAK의 실제 Light_Rpc(bool updateSegment, float burningFor) 시그니처를 사용합니다.
-// - 호스트 검증 완료 후 Photon RPC에 true, 0f 인수를 전달합니다.
-// - updateSegment=true로 다음 구간 진행을 활성화하고 burningFor=0f로 새 점화를 시작합니다.
-// - RPC 실행 결과를 검증하고 실패 시 점화 잠금을 해제합니다.
+// 플러그인 및 설정
+// - 플러그인 버전은 1.1.5입니다.
+// - Delete와 InventoryStack에 HardDependency를, PEAKLib.ModConfig에 SoftDependency를 선언합니다.
+// - 나뭇가지(ItemID 28), 돌(ItemID 72), 횃불(ItemID 109)의 요구 수량을 각각 0~20으로 설정합니다.
+// - 모든 플레이어 집결 여부, 집결 거리 1~50, 요청자 허용 거리 1~15를 설정합니다.
+// - 설정 변경 시 값을 다시 제한 범위에 맞춰 적용하고 현재 조건을 로그에 기록합니다.
+// - AccessTools.Method로 Campfire.Light_Rpc(bool, float)의 MethodInfo를 조회해 보관합니다.
 //
-// 중요
-// - Delete.cs가 PatchAll(typeof(Delete).Assembly)을 실행하므로
-//   Campfire.cs에서 Harmony.PatchAll을 다시 실행하지 않습니다.
-// - Delete.cs, Spawn.cs, LongE.cs, Open.cs, Campfire.cs, Inventory.cs를
-//   하나의 Craft PEAK.dll로 빌드하세요.
-// - 리플렉션을 사용하지 않습니다.
+// 적용 대상
+// - 플러그인이 활성화되어 있고, 활성 씬이 Airport, Title, Pretitle이 아니며,
+//   씬에 MapHandler가 존재할 때만 게임플레이 기능을 활성 상태로 판단합니다.
+// - MapHandler.CurrentCampfire와 동일한 Campfire만 관리 대상으로 처리합니다.
+// - 관리 대상이 아니거나 이미 켜졌거나 FireState.Off가 아닌 모닥불은 점화 요청을 처리하지 않습니다.
+//
+// 점화 요청과 호스트 검증
+// - 로컬 상호작용자의 Photon ActorNumber와 모닥불 PhotonView ID를 확인합니다.
+// - 마스터 클라이언트는 요청을 직접 처리하고, 그 외 클라이언트는 이벤트 170으로 마스터에게 전송합니다.
+// - 마스터는 씬 상태, 요청 데이터, PhotonView, 중복 처리 잠금, 모닥불 상태,
+//   요청자의 생존 상태와 거리, 선택적으로 Campfire.EveryoneInRange 결과를 검증합니다.
+// - 점화 처리 중인 모닥불 View ID는 HashSet에 등록하며, 점화 실패 시 잠금을 제거합니다.
+//
+// 재료 검색과 소비
+// - PlayerHandler.GetAllPlayerCharacters()에서 비활성 Photon 소유자를 제외한 캐릭터를 순회합니다.
+// - 각 플레이어의 일반 itemSlots, tempFullSlot, 착용 배낭의 BackpackData.itemSlots를 검색합니다.
+// - 일반 슬롯과 임시 슬롯의 수량은 InventoryStack.GetStackCount를 사용하고,
+//   배낭 내부 슬롯은 비어 있지 않은 슬롯 하나를 1개로 계산합니다.
+// - 소비 위치는 배낭 내부, 현재 선택되지 않은 외부 슬롯, 현재 선택된 외부 슬롯 순으로 정렬하고,
+//   같은 우선순위에서는 ActorNumber와 슬롯 번호 순으로 재료 계획을 구성합니다.
+// - 계획 수량과 현재 슬롯 상태를 다시 검증한 뒤 ItemSlot.EmptyOut으로 소비합니다.
+// - 소비 후 호스트 인벤토리를 다른 클라이언트에 동기화하고, 관련 변경 콜백과 시각·무게 갱신을 호출합니다.
+// - 소비된 슬롯이 로컬 캐릭터의 현재 선택 슬롯이면 이벤트 172를 통해 장착을 해제합니다.
+//
+// 점화 실행과 결과
+// - 재료 소비가 끝나면 Campfire PhotonView에 Light_Rpc(true, 0f)를 RpcTarget.All로 호출합니다.
+// - 0.25초 뒤 Lit 또는 FireState 변경 여부를 확인해 성공 여부를 판정합니다.
+// - 요청자에게 직접 또는 이벤트 171로 결과를 보내고 UI_Notifications에 메시지를 표시합니다.
+// - 점화 단계, 재료 현황, RPC 호출 및 검증 결과를 로그에 기록합니다.
+//
+// Harmony 패치
+// - Campfire.Interact_CastFinished Prefix는 관리 대상의 꺼진 모닥불만 원본 호출을 차단하고
+//   CampfireGate.RequestIgnition으로 점화 요청을 전달합니다.
+// - 이미 켜졌거나 Off 상태가 아닌 모닥불과 관리 대상이 아닌 모닥불은 원본 메서드를 실행합니다.
+// - Campfire.GetInteractionText Postfix는 꺼진 관리 대상 모닥불의 상호작용 문구에
+//   파티 전체 재료 보유량과 요구량을 색상과 함께 추가합니다.
 
 using BepInEx;
 using BepInEx.Configuration;
@@ -163,8 +175,7 @@ namespace CraftPeak
         private static ConfigEntry<float>
             maximumRequesterDistanceConfig;
 
-        // Photon custom event codes must remain below 200.
-        // 200~255는 Photon 내부 예약 범위입니다.
+        // 점화 요청, 점화 결과, 소비된 선택 슬롯 알림에 사용하는 Photon 이벤트 코드입니다.
         private const byte IgniteRequestEventCode = 170;
         private const byte IgniteResultEventCode = 171;
         private const byte ConsumedSelectedSlotEventCode = 172;
@@ -564,9 +575,7 @@ namespace CraftPeak
 
             try
             {
-                // 현재 PEAK의 Campfire 클래스에는 isPyre 멤버가 없습니다.
-                // MapHandler가 관리하는 현재 구간 모닥불만 대상으로 삼으면
-                // 일반 진행용 모닥불에는 적용되고 최종 Pyre는 자연스럽게 제외됩니다.
+                // MapHandler가 현재 모닥불로 참조하는 인스턴스만 관리 대상으로 지정합니다.
                 return
                     MapHandler.CurrentCampfire ==
                     campfire;
@@ -1587,20 +1596,20 @@ namespace CraftPeak
                 return int.MaxValue;
             }
 
-            // 착용한 배낭 내부 재료를 먼저 사용합니다.
+            // 배낭 내부 슬롯에 있는 재료를 가장 먼저 소비하도록 정렬합니다.
             if (location.IsBackpackInternal)
             {
                 return 0;
             }
 
-            // 손에 들지 않은 일반 슬롯을 두 번째로 사용합니다.
+            // 현재 선택되지 않은 외부 슬롯의 재료를 다음 순서로 소비합니다.
             if (!IsCurrentlySelected(
                     location))
             {
                 return 1;
             }
 
-            // 재료가 손에 든 것밖에 없을 때만 선택 슬롯을 소비합니다.
+            // 현재 선택된 외부 슬롯의 재료를 마지막 순서로 소비합니다.
             return 2;
         }
 
@@ -2497,13 +2506,9 @@ namespace CraftPeak
     }
 
     /// <summary>
-    /// 꺼진 일반 모닥불의 원본 점화 완료를 가로챕니다.
-    ///
-    /// 켜진 모닥불은 원본 요리 로직을 그대로 실행합니다.
-    /// 꺼진 모닥불은 클라이언트가 직접 Light_Rpc를 보내지 못하게 막고,
-    /// CampfireGate를 통해 호스트 검증 후 점화합니다.
-    ///
-    /// Delete.cs의 PatchAll 호출로 이 패치가 적용됩니다.
+    /// 관리 대상 모닥불이 꺼져 있을 때 원본 Interact_CastFinished 실행을 막고
+    /// CampfireGate의 호스트 검증 점화 요청으로 대체합니다.
+    /// 그 외 모닥불 상태에서는 원본 메서드를 실행합니다.
     /// </summary>
     [HarmonyPatch(
         typeof(global::Campfire),
@@ -2523,7 +2528,7 @@ namespace CraftPeak
                 return true;
             }
 
-            // 이미 켜진 모닥불의 요리 완료는 PEAK 원본 로직을 사용합니다.
+            // 켜져 있거나 Off가 아닌 상태에서는 원본 상호작용 완료 로직을 실행합니다.
             if (__instance.Lit ||
                 __instance.state !=
                     global::Campfire.FireState.Off)
@@ -2539,13 +2544,14 @@ namespace CraftPeak
                         interactor);
             }
 
-            // 원본의 무조건 Light_Rpc 호출은 차단합니다.
+            // 꺼진 관리 대상 모닥불의 원본 호출을 차단합니다.
             return false;
         }
     }
 
     /// <summary>
-    /// 모닥불 상호작용 문구 아래에 파티 전체 재료 보유 현황을 표시합니다.
+    /// 꺼진 관리 대상 모닥불의 상호작용 문구에
+    /// 파티 인벤토리의 재료 보유량과 설정된 요구량을 추가합니다.
     /// </summary>
     [HarmonyPatch(
         typeof(global::Campfire),
