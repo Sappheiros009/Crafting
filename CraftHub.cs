@@ -7,6 +7,7 @@
 // - 설명
 // - 강화
 // - 제작
+// - 합성
 // - 판매
 // - 부품
 //
@@ -16,8 +17,13 @@
 // - 제작 요청은 호스트가 공유 돈, 제작 등급, 출력 공간과 제작 요청자 본인의 재료를 다시 검증합니다.
 // - 제작 탭의 제작 재료는 제작 요청자 본인의 일반 슬롯, 임시 손 슬롯과 배낭 내부 슬롯에서만 합산·소비합니다.
 // - 제작식과 진행용 재료 조합은 호스트가 Room Property에 기록한 공유 시드로 결정합니다.
-// - 강화 상태는 자원 등급, 적재 단계, 다음 모닥불 단계, 수집량 배율과 판매 배율을 Room Property로 동기화합니다.
-// - 적재 단계는 슬롯 최대 수량을 증가시키고, 수집량은 x1~x5, 판매가는 x1·x2·x4·x8·x16으로 적용합니다.
+// - 강화 상태는 적재 단계, 다음 모닥불 단계, 수집량 배율과 판매 배율을 Room Property로 동기화합니다.
+// - 자원 등급 강화는 사용하지 않으며 기존 제작 등급 조건은 내부적으로 최고 단계로 처리합니다.
+// - 적재 단계, 수집량과 판매 수익은 최대 10강까지 적용되며 후반 강화 비용은 제곱식으로 증가합니다.
+// - 합성은 요청자 본인의 일반 슬롯, 임시 손 슬롯과 배낭 내부 슬롯 재료만 소비합니다.
+// - 망원경, 빙봉, 나팔, 플라잉 디스크는 나뭇가지·돌·소라고둥 총 10개로 구성된 서로 다른 고정 조합식을 사용합니다.
+// - 가이드북과 스크롤은 망원경·빙봉·나팔·플라잉 디스크 총 20개로 구성된 서로 다른 고정 조합식을 사용합니다.
+// - 괴상 버섯은 가이드북 15개와 스크롤 15개, 이상한 보석은 괴상 버섯 50개를 요구합니다.
 // - ApplyUpgradeEffects는 CalculateEffectiveCampfireMaterials가 반환하는 0, 0, 0을 CampfireGate 재료 설정에 적용합니다.
 // - 비행기 부품은 구간별 구매 마스크와 사용 마스크로 저장하며, 현재 모닥불 점화 성공 후 해당 구간 부품을 사용 처리합니다.
 // - 정상에서 ItemID 32 조명탄 제작이 성공하면 PeakUnlocked 상태를 저장하고 완료 이벤트를 전체에 전송합니다.
@@ -80,12 +86,12 @@ namespace CraftPeak
             "Craft PEAK Unified Hub";
 
         public const string PluginVersion =
-            "2.13.2";
+            "2.13.5";
 
         public const string DeveloperName =
             "Sapphire009";
 
-        // 판매, 제작, 강화, 부품, 진행 알림, 최종 조명탄과 개발자 돈 요청에 사용하는 Photon 이벤트 코드입니다.
+        // 판매, 제작, 합성, 강화, 부품, 진행 알림, 최종 조명탄과 개발자 돈 요청에 사용하는 Photon 이벤트 코드입니다.
         private const byte SellRequestEventCode = 140;
         private const byte SellResultEventCode = 141;
         private const byte SellConsumeRequestEventCode = 153;
@@ -105,6 +111,9 @@ namespace CraftPeak
 
         private const byte DeveloperMoneyRequestEventCode = 151;
         private const byte DeveloperMoneyResultEventCode = 152;
+
+        private const byte SynthesisRequestEventCode = 155;
+        private const byte SynthesisResultEventCode = 156;
 
         private const string SharedMoneyKey =
             "CraftPeak.SharedMoney";
@@ -182,14 +191,16 @@ namespace CraftPeak
 
         private const int UpgradeProtocolVersion = 1;
 
+        // 제작식과 진행 조건의 기존 5단계 등급 범위를 유지하기 위한 내부 상수입니다.
+        // 강화 탭에서는 자원 등급을 표시하거나 구매하지 않습니다.
         private const int ResourceUpgradeMaximum = 4;
-        private const int StackUpgradeMaximum = 4;
+        private const int StackUpgradeMaximum = 10;
 
         private const int DefaultBaseStackCount =
             10;
         private const int CampfireUpgradeMaximum = 4;
-        private const int YieldUpgradeMaximum = 4;
-        private const int SellValueUpgradeMaximum = 4;
+        private const int YieldUpgradeMaximum = 10;
+        private const int SellValueUpgradeMaximum = 10;
 
         private const double MinimumRequestIntervalSeconds = 0.25d;
         private const float PartyResourceCacheSeconds = 1.00f;
@@ -200,7 +211,28 @@ namespace CraftPeak
             5,
             10,
             20,
-            40
+            40,
+            55,
+            70,
+            90,
+            110,
+            135,
+            160
+        };
+
+        private static readonly int[] SellMultiplierByLevel =
+        {
+            1,
+            2,
+            4,
+            8,
+            16,
+            24,
+            36,
+            52,
+            72,
+            96,
+            128
         };
 
         private static readonly float[] CampfireRequirementFactors =
@@ -340,6 +372,10 @@ namespace CraftPeak
             craftRecipesByOutputId =
                 new Dictionary<ushort, CraftRecipe>();
 
+        private static readonly List<SynthesisRecipe>
+            SynthesisRecipes =
+                new List<SynthesisRecipe>();
+
         private readonly Dictionary<int, double>
             lastSellRequestAtByActor =
                 new Dictionary<int, double>();
@@ -371,6 +407,10 @@ namespace CraftPeak
                 new Dictionary<int, double>();
 
         private readonly Dictionary<int, double>
+            lastSynthesisRequestAtByActor =
+                new Dictionary<int, double>();
+
+        private readonly Dictionary<int, double>
             lastPartRequestAtByActor =
                 new Dictionary<int, double>();
 
@@ -384,9 +424,10 @@ namespace CraftPeak
             HubLanguage.English;
 
         private UpgradeKind selectedUpgradeKind =
-            UpgradeKind.ResourceGrade;
+            UpgradeKind.StackCapacity;
 
         private int selectedCraftRecipeIndex = -1;
+        private int selectedSynthesisRecipeIndex;
         private int craftPage;
 
         private CraftUiCategory selectedCraftUiCategory =
@@ -436,7 +477,6 @@ namespace CraftPeak
         private string lastAppliedUpgradeRunId =
             string.Empty;
 
-        private UpgradeFormulaConfig resourceUpgradeFormula;
         private UpgradeFormulaConfig stackUpgradeFormula;
         private UpgradeFormulaConfig campfireUpgradeFormula;
 
@@ -451,6 +491,9 @@ namespace CraftPeak
 
         private string craftStatus =
             "제작할 아이템을 선택하세요.";
+
+        private string synthesisStatus =
+            "합성할 단계를 선택하세요.";
 
         private string sellStatus =
             "판매할 인벤토리 슬롯을 선택하세요.";
@@ -489,7 +532,8 @@ namespace CraftPeak
             Craft = 2,
             Sell = 3,
             Parts = 4,
-            Developer = 5
+            Synthesis = 5,
+            Developer = 6
         }
 
         internal enum HubLanguage
@@ -572,6 +616,216 @@ namespace CraftPeak
         private static readonly UiTranslationEntry[]
             UiTranslationEntries =
             {
+            new UiTranslationEntry(
+                "본인 인벤토리의 합성 재료와 결과 공간을 확인하세요.",
+                "본인 인벤토리의 합성 재료와 결과 공간을 확인하세요.",
+                "Check your own inventory materials and result space.",
+                "请检查自己背包中的合成材料和结果空间。",
+                "自分のインベントリ内の合成素材と結果用スペースを確認してください。",
+                "Vérifiez les matériaux de votre inventaire et l’espace pour le résultat."),
+            new UiTranslationEntry(
+                "합성 결과 지급 중 오류가 발생했습니다. 재료는 복구되지 않았습니다.",
+                "합성 결과 지급 중 오류가 발생했습니다. 재료는 복구되지 않았습니다.",
+                "An error occurred while delivering the synthesis result. Materials were not restored.",
+                "发放合成结果时发生错误，材料未恢复。",
+                "合成結果の付与中にエラーが発生しました。素材は復元されませんでした。",
+                "Une erreur est survenue lors de la remise du résultat de synthèse. Les matériaux n’ont pas été restaurés."),
+            new UiTranslationEntry(
+                "합성 단계 번호를 해석하지 못했습니다.",
+                "합성 단계 번호를 해석하지 못했습니다.",
+                "Could not read the synthesis tier number.",
+                "无法解析合成阶段编号。",
+                "合成段階番号を解析できませんでした。",
+                "Impossible d’interpréter le numéro du niveau de synthèse."),
+            new UiTranslationEntry(
+                "등록되지 않은 합성식입니다.",
+                "등록되지 않은 합성식입니다.",
+                "This synthesis recipe is not registered.",
+                "该合成配方未注册。",
+                "未登録の合成レシピです。",
+                "Cette recette de synthèse n’est pas enregistrée."),
+            new UiTranslationEntry(
+                "잘못된 합성 요청입니다.",
+                "잘못된 합성 요청입니다.",
+                "Invalid synthesis request.",
+                "合成请求无效。",
+                "合成リクエストが不正です。",
+                "Demande de synthèse invalide."),
+            new UiTranslationEntry(
+                "현재는 합성할 수 없습니다.",
+                "현재는 합성할 수 없습니다.",
+                "Synthesis is not currently available.",
+                "当前无法合成。",
+                "現在は合成できません。",
+                "La synthèse n’est pas disponible actuellement."),
+            new UiTranslationEntry(
+                "합성 결과 지급 중 오류가 발생했습니다.",
+                "합성 결과 지급 중 오류가 발생했습니다.",
+                "An error occurred while delivering the synthesis result.",
+                "发放合成结果时发生错误。",
+                "合成結果の付与中にエラーが発生しました。",
+                "Une erreur est survenue lors de la remise du résultat de synthèse."),
+            new UiTranslationEntry(
+                "합성 결과를 받을 인벤토리 공간이 없습니다.",
+                "합성 결과를 받을 인벤토리 공간이 없습니다.",
+                "There is no inventory space for the synthesis result.",
+                "背包中没有空间容纳合成结果。",
+                "合成結果を受け取るインベントリ空間がありません。",
+                "Il n’y a pas de place dans l’inventaire pour le résultat de synthèse."),
+            new UiTranslationEntry(
+                "합성 재료 소비 중 인벤토리가 변경되었습니다. 다시 시도하세요.",
+                "합성 재료 소비 중 인벤토리가 변경되었습니다. 다시 시도하세요.",
+                "The inventory changed while consuming synthesis materials. Try again.",
+                "消耗合成材料时背包发生变化，请重试。",
+                "合成素材の消費中にインベントリが変化しました。もう一度お試しください。",
+                "L’inventaire a changé pendant la consommation des matériaux de synthèse. Réessayez."),
+            new UiTranslationEntry(
+                "합성 결과 데이터가 올바르지 않습니다.",
+                "합성 결과 데이터가 올바르지 않습니다.",
+                "The synthesis result data is invalid.",
+                "合成结果数据无效。",
+                "合成結果データが不正です。",
+                "Les données du résultat de synthèse sont invalides."),
+            new UiTranslationEntry(
+                "합성 결과를 해석하지 못했습니다.",
+                "합성 결과를 해석하지 못했습니다.",
+                "Could not read the synthesis result.",
+                "无法解析合成结果。",
+                "合成結果を解析できませんでした。",
+                "Impossible d’interpréter le résultat de synthèse."),
+            new UiTranslationEntry(
+                "합성 요청 전송에 실패했습니다.",
+                "합성 요청 전송에 실패했습니다.",
+                "Failed to send the synthesis request.",
+                "发送合成请求失败。",
+                "合成リクエストの送信に失敗しました。",
+                "Échec de l’envoi de la demande de synthèse."),
+            new UiTranslationEntry(
+                "합성 요청이 너무 빠릅니다.",
+                "합성 요청이 너무 빠릅니다.",
+                "Synthesis requests are being sent too quickly.",
+                "合成请求过于频繁。",
+                "合成リクエストが早すぎます。",
+                "Les demandes de synthèse sont trop rapides."),
+            new UiTranslationEntry(
+                "합성할 단계를 선택하세요.",
+                "합성할 단계를 선택하세요.",
+                "Select a synthesis tier.",
+                "请选择合成阶段。",
+                "合成段階を選択してください。",
+                "Sélectionnez un niveau de synthèse."),
+            new UiTranslationEntry(
+                "합성 요청이 거부되었습니다.",
+                "합성 요청이 거부되었습니다.",
+                "The synthesis request was rejected.",
+                "合成请求被拒绝。",
+                "合成リクエストが拒否されました。",
+                "La demande de synthèse a été refusée."),
+            new UiTranslationEntry(
+                "합성에 성공했습니다.",
+                "합성에 성공했습니다.",
+                "Synthesis succeeded.",
+                "合成成功。",
+                "合成に成功しました。",
+                "Synthèse réussie."),
+            new UiTranslationEntry(
+                "합성을 요청했습니다...",
+                "합성을 요청했습니다...",
+                " synthesis requested...",
+                " 已请求合成……",
+                "の合成をリクエストしました...",
+                " : synthèse demandée..."),
+            new UiTranslationEntry(
+                "망원경 합성",
+                "망원경 합성",
+                "Binoculars Synthesis",
+                "双筒望远镜合成",
+                "双眼鏡合成",
+                "Synthèse de jumelles"),
+            new UiTranslationEntry(
+                "빙봉 합성",
+                "빙봉 합성",
+                "Bing Bong Synthesis",
+                "冰棒合成",
+                "ビン・ボン合成",
+                "Synthèse de Bing Bong"),
+            new UiTranslationEntry(
+                "나팔 합성",
+                "나팔 합성",
+                "Bugle Synthesis",
+                "号角合成",
+                "ラッパ合成",
+                "Synthèse de clairon"),
+            new UiTranslationEntry(
+                "플라잉 디스크 합성",
+                "플라잉 디스크 합성",
+                "Frisbee Synthesis",
+                "飞盘合成",
+                "フリスビー合成",
+                "Synthèse de frisbee"),
+            new UiTranslationEntry(
+                "일반 자원 합성",
+                "일반 자원 합성",
+                "Common Resource Synthesis",
+                "普通资源合成",
+                "コモン資源合成",
+                "Synthèse de ressources communes"),
+            new UiTranslationEntry(
+                "보통 자원 합성",
+                "보통 자원 합성",
+                "Normal Resource Synthesis",
+                "标准资源合成",
+                "ノーマル資源合成",
+                "Synthèse de ressources normales"),
+            new UiTranslationEntry(
+                "희귀 자원 합성",
+                "희귀 자원 합성",
+                "Rare Resource Synthesis",
+                "稀有资源合成",
+                "レア資源合成",
+                "Synthèse de ressources rares"),
+            new UiTranslationEntry(
+                "괴상 버섯 압축 합성",
+                "괴상 버섯 압축 합성",
+                "Weird Shroom Compression",
+                "怪异蘑菇压缩合成",
+                "奇妙なキノコ圧縮合成",
+                "Compression de champignons étranges"),
+            new UiTranslationEntry(
+                "합성 결과",
+                "합성 결과",
+                "Synthesis result",
+                "合成结果",
+                "合成結果",
+                "Résultat de synthèse"),
+            new UiTranslationEntry(
+                "무작위 결과 후보",
+                "무작위 결과 후보",
+                "Random result pool",
+                "随机结果候选",
+                "ランダム結果候補",
+                "Résultats aléatoires possibles"),
+            new UiTranslationEntry(
+                "필요 재료",
+                "필요 재료",
+                "Required materials",
+                "所需材料",
+                "必要素材",
+                "Matériaux requis"),
+            new UiTranslationEntry(
+                "합성 시도",
+                "합성 시도",
+                "Synthesize",
+                "合成",
+                "合成する",
+                "Synthétiser"),
+            new UiTranslationEntry(
+                "합성",
+                "합성",
+                "Synthesis",
+                "合成",
+                "合成",
+                "Synthèse"),
             new UiTranslationEntry(
                 "모닥불 점화 조건 미충족\nP 메뉴 강화 탭의 다음 모닥불 제작에서 ",
                 "모닥불 점화 조건 미충족\nP 메뉴 강화 탭의 다음 모닥불 제작에서 ",
@@ -3695,7 +3949,8 @@ namespace CraftPeak
             Sell = 1,
             Craft = 2,
             Upgrade = 3,
-            Parts = 4
+            Parts = 4,
+            Synthesis = 5
         }
 
         internal enum RecipeTier
@@ -3752,6 +4007,42 @@ namespace CraftPeak
             public readonly List<IngredientCost>
                 Ingredients =
                     new List<IngredientCost>();
+        }
+
+        internal sealed class SynthesisRecipe
+        {
+            public int Index;
+            public string DisplayName;
+
+            public readonly List<IngredientCost>
+                Ingredients =
+                    new List<IngredientCost>();
+
+            public ushort[] OutputItemIds;
+
+            public SynthesisRecipe(
+                int index,
+                string displayName,
+                ushort[] outputItemIds,
+                params IngredientCost[] ingredients)
+            {
+                Index =
+                    index;
+
+                DisplayName =
+                    displayName ??
+                    string.Empty;
+
+                OutputItemIds =
+                    outputItemIds ??
+                    Array.Empty<ushort>();
+
+                if (ingredients != null)
+                {
+                    Ingredients.AddRange(
+                        ingredients);
+                }
+            }
         }
 
         private sealed class CampfireBuildRecipe
@@ -3817,12 +4108,22 @@ namespace CraftPeak
 
         internal enum UpgradeKind
         {
+            // 외부 호환성을 위해 값은 남기지만 강화 탭에는 표시하지 않고 요청도 거부합니다.
             ResourceGrade = 0,
             StackCapacity = 1,
             CampfireEfficiency = 2,
             DoubleYield = 3,
             SellValue = 4
         }
+
+        private static readonly UpgradeKind[]
+            VisibleUpgradeKinds =
+            {
+                UpgradeKind.StackCapacity,
+                UpgradeKind.CampfireEfficiency,
+                UpgradeKind.DoubleYield,
+                UpgradeKind.SellValue
+            };
 
         private sealed class UpgradeFormulaConfig
         {
@@ -3906,7 +4207,7 @@ namespace CraftPeak
                             string.Empty,
 
                         ResourceLevel =
-                            0,
+                            ResourceUpgradeMaximum,
 
                         StackLevel =
                             0,
@@ -4005,11 +4306,9 @@ namespace CraftPeak
         {
             get
             {
+                // 자원 등급 강화가 제거되었으므로 기존 등급 조건은 항상 최고 단계로 통과시킵니다.
                 return
-                    Instance != null
-                        ? Instance.upgradeState
-                            .ResourceLevel
-                        : 0;
+                    ResourceUpgradeMaximum;
             }
         }
 
@@ -4081,7 +4380,7 @@ namespace CraftPeak
                 " loaded. Existing Shop/Store/Upgrade files are not required. Press P." +
                 " CustomEventCodes=" +
                 SellRequestEventCode + "-" +
-                DeveloperMoneyResultEventCode +
+                SynthesisResultEventCode +
                 " (Photon-safe range)" +
                 " | Room-fixed host recipe synchronization enabled");
         }
@@ -4116,6 +4415,7 @@ namespace CraftPeak
             localPendingSale = null;
             lastCraftRequestAtByActor.Clear();
             lastUpgradeRequestAtByActor.Clear();
+            lastSynthesisRequestAtByActor.Clear();
             lastPartRequestAtByActor.Clear();
 
             if (Instance == this)
@@ -4307,10 +4607,13 @@ namespace CraftPeak
                 HubTab.Description;
 
             selectedUpgradeKind =
-                UpgradeKind.ResourceGrade;
+                UpgradeKind.StackCapacity;
 
             selectedCraftRecipeIndex =
                 -1;
+
+            selectedSynthesisRecipeIndex =
+                0;
 
             selectedSellSlotId =
                 -1;
@@ -4329,6 +4632,9 @@ namespace CraftPeak
 
             craftStatus =
                 "제작할 아이템을 선택하세요.";
+
+            synthesisStatus =
+                "합성할 단계를 선택하세요.";
 
             sellStatus =
                 "판매할 인벤토리 슬롯을 선택하세요.";
@@ -4496,6 +4802,7 @@ namespace CraftPeak
 
             EnsureSharedRecipeSeed();
             EnsureProgressionRecipesBuilt();
+            EnsureSynthesisRecipesBuilt();
             LoadUpgradeStateOnDemand();
             LoadPartsStateOnDemand();
 
@@ -4709,6 +5016,21 @@ namespace CraftPeak
             }
 
             if (tab ==
+                HubTab.Synthesis)
+            {
+                EnsureSynthesisRecipesBuilt();
+
+                if (selectedSynthesisRecipeIndex <
+                        0 ||
+                    selectedSynthesisRecipeIndex >=
+                        SynthesisRecipes.Count)
+                {
+                    selectedSynthesisRecipeIndex =
+                        0;
+                }
+            }
+
+            if (tab ==
                 HubTab.Parts)
             {
                 int currentSegment =
@@ -4772,6 +5094,9 @@ namespace CraftPeak
                 case HubTab.Craft:
                     return "제작";
 
+                case HubTab.Synthesis:
+                    return "합성";
+
                 case HubTab.Sell:
                     return "판매";
 
@@ -4823,6 +5148,9 @@ namespace CraftPeak
                 case HubTab.Craft:
                     return craftStatus;
 
+                case HubTab.Synthesis:
+                    return synthesisStatus;
+
                 case HubTab.Sell:
                     return sellStatus;
 
@@ -4857,6 +5185,11 @@ namespace CraftPeak
 
                 case HubTab.Craft:
                     craftStatus =
+                        safe;
+                    break;
+
+                case HubTab.Synthesis:
+                    synthesisStatus =
                         safe;
                     break;
 
@@ -4967,6 +5300,30 @@ namespace CraftPeak
                 ConsumedSlotEventCode)
             {
                 HandleConsumedSelectedSlots(
+                    photonEvent.CustomData as
+                        object[]);
+
+                return;
+            }
+
+            if (photonEvent.Code ==
+                SynthesisRequestEventCode)
+            {
+                if (PhotonNetwork.IsMasterClient)
+                {
+                    ProcessSynthesisRequestOnHost(
+                        photonEvent.Sender,
+                        photonEvent.CustomData as
+                            object[]);
+                }
+
+                return;
+            }
+
+            if (photonEvent.Code ==
+                SynthesisResultEventCode)
+            {
+                HandleSynthesisResult(
                     photonEvent.CustomData as
                         object[]);
 
@@ -5123,6 +5480,9 @@ namespace CraftPeak
                 case PendingRequest.Parts:
                     return HubTab.Parts;
 
+                case PendingRequest.Synthesis:
+                    return HubTab.Synthesis;
+
                 default:
                     return HubTab.Upgrade;
             }
@@ -5261,6 +5621,67 @@ namespace CraftPeak
                 SetTabStatus(
                     HubTab.Craft,
                     "제작 결과를 해석하지 못했습니다.");
+            }
+        }
+
+
+        private void HandleSynthesisResult(
+            object[] resultData)
+        {
+            pendingRequest =
+                PendingRequest.None;
+
+            partyResourceCacheUntil =
+                0f;
+
+            if (resultData == null ||
+                resultData.Length <
+                    4)
+            {
+                SetTabStatus(
+                    HubTab.Synthesis,
+                    "합성 결과 데이터가 올바르지 않습니다.");
+
+                return;
+            }
+
+            try
+            {
+                bool materialsConsumed =
+                    Convert.ToBoolean(
+                        resultData[0]);
+
+                bool success =
+                    Convert.ToBoolean(
+                        resultData[1]);
+
+                string message =
+                    resultData[3] as
+                        string ??
+                    string.Empty;
+
+                if (string.IsNullOrEmpty(
+                        message))
+                {
+                    message =
+                        success
+                            ? "합성에 성공했습니다."
+                            : (
+                                materialsConsumed
+                                    ? "합성 결과 지급 중 오류가 발생했습니다."
+                                    : "합성 요청이 거부되었습니다."
+                            );
+                }
+
+                SetTabStatus(
+                    HubTab.Synthesis,
+                    message);
+            }
+            catch (Exception)
+            {
+                SetTabStatus(
+                    HubTab.Synthesis,
+                    "합성 결과를 해석하지 못했습니다.");
             }
         }
 
@@ -8317,21 +8738,8 @@ namespace CraftPeak
 
         private static int GetCurrentResourceLevel()
         {
-            if (PhotonNetwork.InRoom &&
-                PhotonNetwork.CurrentRoom !=
-                    null)
-            {
-                return
-                    Mathf.Clamp(
-                        ReadRoomInt(
-                            UpgradeResourceKey,
-                            ResourceUpgradeLevel),
-                        0,
-                        ResourceUpgradeMaximum);
-            }
-
             return
-                ResourceUpgradeLevel;
+                ResourceUpgradeMaximum;
         }
 
         private static string ReadRoomString(
@@ -10296,6 +10704,488 @@ namespace CraftPeak
             }
         }
 
+
+        // -----------------------------------------------------------------
+        // 합성 탭 연결
+        // -----------------------------------------------------------------
+
+        private static void EnsureSynthesisRecipesBuilt()
+        {
+            if (SynthesisRecipes.Count ==
+                8)
+            {
+                return;
+            }
+
+            SynthesisRecipes.Clear();
+
+            // Common 자원 조합식은 각 결과물마다 서로 다르며,
+            // 나뭇가지·돌·소라고둥의 요구 수량 합계는 모두 10개입니다.
+            SynthesisRecipes.Add(
+                new SynthesisRecipe(
+                    0,
+                    "망원경 합성",
+                    new[]
+                    {
+                        BinocularsItemId
+                    },
+                    new IngredientCost(
+                        FireWoodItemId,
+                        10)));
+
+            SynthesisRecipes.Add(
+                new SynthesisRecipe(
+                    1,
+                    "빙봉 합성",
+                    new[]
+                    {
+                        BingBongItemId
+                    },
+                    new IngredientCost(
+                        FireWoodItemId,
+                        2),
+                    new IngredientCost(
+                        StoneItemId,
+                        3),
+                    new IngredientCost(
+                        ConchItemId,
+                        5)));
+
+            SynthesisRecipes.Add(
+                new SynthesisRecipe(
+                    2,
+                    "나팔 합성",
+                    new[]
+                    {
+                        BugleItemId
+                    },
+                    new IngredientCost(
+                        FireWoodItemId,
+                        5),
+                    new IngredientCost(
+                        StoneItemId,
+                        2),
+                    new IngredientCost(
+                        ConchItemId,
+                        3)));
+
+            SynthesisRecipes.Add(
+                new SynthesisRecipe(
+                    3,
+                    "플라잉 디스크 합성",
+                    new[]
+                    {
+                        FrisbeeItemId
+                    },
+                    new IngredientCost(
+                        FireWoodItemId,
+                        3),
+                    new IngredientCost(
+                        StoneItemId,
+                        5),
+                    new IngredientCost(
+                        ConchItemId,
+                        2)));
+
+            // Normal 자원 조합식도 결과물마다 서로 다르며,
+            // 망원경·빙봉·나팔·플라잉 디스크의 요구 수량 합계는 각각 20개입니다.
+            SynthesisRecipes.Add(
+                new SynthesisRecipe(
+                    4,
+                    "가이드북 합성",
+                    new[]
+                    {
+                        GuidebookItemId
+                    },
+                    new IngredientCost(
+                        BinocularsItemId,
+                        8),
+                    new IngredientCost(
+                        BingBongItemId,
+                        5),
+                    new IngredientCost(
+                        BugleItemId,
+                        4),
+                    new IngredientCost(
+                        FrisbeeItemId,
+                        3)));
+
+            SynthesisRecipes.Add(
+                new SynthesisRecipe(
+                    5,
+                    "스크롤 합성",
+                    new[]
+                    {
+                        ScrollItemId
+                    },
+                    new IngredientCost(
+                        BinocularsItemId,
+                        3),
+                    new IngredientCost(
+                        BingBongItemId,
+                        4),
+                    new IngredientCost(
+                        BugleItemId,
+                        5),
+                    new IngredientCost(
+                        FrisbeeItemId,
+                        8)));
+
+            SynthesisRecipes.Add(
+                new SynthesisRecipe(
+                    6,
+                    "괴상 버섯 합성",
+                    new[]
+                    {
+                        WeirdShroomItemId
+                    },
+                    new IngredientCost(
+                        GuidebookItemId,
+                        15),
+                    new IngredientCost(
+                        ScrollItemId,
+                        15)));
+
+            SynthesisRecipes.Add(
+                new SynthesisRecipe(
+                    7,
+                    "이상한 보석 합성",
+                    new[]
+                    {
+                        StrangeGemItemId
+                    },
+                    new IngredientCost(
+                        WeirdShroomItemId,
+                        50)));
+        }
+
+        internal SynthesisRecipe SelectedSynthesisRecipe
+        {
+            get
+            {
+                EnsureSynthesisRecipesBuilt();
+
+                return
+                    selectedSynthesisRecipeIndex >=
+                        0 &&
+                    selectedSynthesisRecipeIndex <
+                        SynthesisRecipes.Count
+                        ? SynthesisRecipes[
+                            selectedSynthesisRecipeIndex]
+                        : null;
+            }
+        }
+
+        internal SynthesisRecipe GetSynthesisRecipeAtRow(
+            int rowIndex)
+        {
+            EnsureSynthesisRecipesBuilt();
+
+            return
+                rowIndex >= 0 &&
+                rowIndex <
+                    SynthesisRecipes.Count
+                    ? SynthesisRecipes[
+                        rowIndex]
+                    : null;
+        }
+
+        internal void SelectSynthesisRecipe(
+            int recipeIndex)
+        {
+            EnsureSynthesisRecipesBuilt();
+
+            if (recipeIndex <
+                    0 ||
+                recipeIndex >=
+                    SynthesisRecipes.Count)
+            {
+                return;
+            }
+
+            selectedSynthesisRecipeIndex =
+                recipeIndex;
+
+            SetTabStatus(
+                HubTab.Synthesis,
+                SynthesisRecipes[
+                    recipeIndex]
+                    .DisplayName +
+                "을(를) 선택했습니다.");
+        }
+
+        private static string BuildSynthesisOutputNameList(
+            SynthesisRecipe recipe)
+        {
+            if (recipe == null ||
+                recipe.OutputItemIds == null ||
+                recipe.OutputItemIds.Length ==
+                    0)
+            {
+                return
+                    "<아이템 데이터 확인 필요>";
+            }
+
+            StringBuilder builder =
+                new StringBuilder();
+
+            for (int i = 0;
+                 i <
+                     recipe.OutputItemIds.Length;
+                 i++)
+            {
+                if (builder.Length >
+                    0)
+                {
+                    builder.Append(
+                        " / ");
+                }
+
+                builder.Append(
+                    GetIngredientDisplayName(
+                        recipe.OutputItemIds[i]));
+            }
+
+            return
+                builder.ToString();
+        }
+
+        private static bool CanReceiveAnySynthesisOutput(
+            global::Player player,
+            SynthesisRecipe recipe)
+        {
+            if (player == null ||
+                recipe == null ||
+                recipe.OutputItemIds == null)
+            {
+                return false;
+            }
+
+            for (int i = 0;
+                 i <
+                     recipe.OutputItemIds.Length;
+                 i++)
+            {
+                ushort outputId =
+                    recipe.OutputItemIds[i];
+
+                if (outputId != 0 &&
+                    player.HasEmptySlot(
+                        outputId))
+                {
+                    return true;
+                }
+            }
+
+            return false;
+        }
+
+        internal string BuildSynthesisRowText(
+            SynthesisRecipe recipe)
+        {
+            if (recipe == null)
+            {
+                return string.Empty;
+            }
+
+            return
+                recipe.DisplayName +
+                "  |  " +
+                BuildSynthesisOutputNameList(
+                    recipe);
+        }
+
+        internal string BuildSynthesisDetailText(
+            SynthesisRecipe recipe,
+            out bool ready)
+        {
+            ready =
+                false;
+
+            if (recipe == null)
+            {
+                return
+                    "합성할 단계를 선택하세요.";
+            }
+
+            global::Player player =
+                global::Player.localPlayer;
+
+            bool materialsReady =
+                player != null;
+
+            sharedTextBuilder.Length =
+                0;
+
+            sharedTextBuilder.Append(
+                recipe.DisplayName);
+
+            sharedTextBuilder.Append(
+                "\n\n필요 재료");
+
+            for (int i = 0;
+                 i <
+                     recipe.Ingredients.Count;
+                 i++)
+            {
+                IngredientCost cost =
+                    recipe.Ingredients[i];
+
+                int available =
+                    CountLocalItemUnits(
+                        cost.ItemId);
+
+                bool enough =
+                    available >=
+                    cost.Count;
+
+                materialsReady &=
+                    enough;
+
+                sharedTextBuilder.Append(
+                    "\n");
+
+                sharedTextBuilder.Append(
+                    enough
+                        ? "<color=#79E081>"
+                        : "<color=#FF8A80>");
+
+                sharedTextBuilder.Append(
+                    GetIngredientDisplayName(
+                        cost.ItemId));
+
+                sharedTextBuilder.Append(
+                    " ");
+
+                sharedTextBuilder.Append(
+                    available);
+
+                sharedTextBuilder.Append(
+                    "/");
+
+                sharedTextBuilder.Append(
+                    cost.Count);
+
+                sharedTextBuilder.Append(
+                    "</color>");
+            }
+
+            sharedTextBuilder.Append(
+                recipe.OutputItemIds != null &&
+                recipe.OutputItemIds.Length == 1
+                    ? "\n\n합성 결과\n"
+                    : "\n\n무작위 결과 후보\n");
+
+            sharedTextBuilder.Append(
+                BuildSynthesisOutputNameList(
+                    recipe));
+
+            bool outputSpaceReady =
+                CanReceiveAnySynthesisOutput(
+                    player,
+                    recipe);
+
+            if (!outputSpaceReady)
+            {
+                sharedTextBuilder.Append(
+                    "\n\n<color=#FF8A80>합성 결과를 받을 인벤토리 공간이 없습니다.</color>");
+            }
+
+            ready =
+                materialsReady &&
+                outputSpaceReady &&
+                pendingRequest ==
+                    PendingRequest.None;
+
+            return
+                sharedTextBuilder
+                    .ToString();
+        }
+
+        internal void RequestSynthesis()
+        {
+            if (pendingRequest !=
+                PendingRequest.None)
+            {
+                SetTabStatus(
+                    HubTab.Synthesis,
+                    "다른 요청을 처리 중입니다.");
+
+                return;
+            }
+
+            SynthesisRecipe recipe =
+                SelectedSynthesisRecipe;
+
+            bool ready;
+
+            BuildSynthesisDetailText(
+                recipe,
+                out ready);
+
+            if (recipe == null ||
+                !ready)
+            {
+                SetTabStatus(
+                    HubTab.Synthesis,
+                    "본인 인벤토리의 합성 재료와 결과 공간을 확인하세요.");
+
+                return;
+            }
+
+            pendingRequest =
+                PendingRequest.Synthesis;
+
+            requestStartedAt =
+                Time.unscaledTime;
+
+            SetTabStatus(
+                HubTab.Synthesis,
+                recipe.DisplayName +
+                " 합성을 요청했습니다...");
+
+            object[] payload =
+            {
+                recipe.Index
+            };
+
+            int actor =
+                LocalActorNumber();
+
+            if (PhotonNetwork.IsMasterClient)
+            {
+                ProcessSynthesisRequestOnHost(
+                    actor,
+                    payload);
+
+                return;
+            }
+
+            RaiseEventOptions options =
+                new RaiseEventOptions
+                {
+                    Receivers =
+                        ReceiverGroup.MasterClient
+                };
+
+            bool sent =
+                PhotonNetwork.RaiseEvent(
+                    SynthesisRequestEventCode,
+                    payload,
+                    options,
+                    SendOptions.SendReliable);
+
+            if (!sent)
+            {
+                pendingRequest =
+                    PendingRequest.None;
+
+                SetTabStatus(
+                    HubTab.Synthesis,
+                    "합성 요청 전송에 실패했습니다.");
+            }
+        }
+
         // -----------------------------------------------------------------
         // 강화 탭 연결
         // -----------------------------------------------------------------
@@ -10312,6 +11202,13 @@ namespace CraftPeak
         internal void SelectUpgradeKind(
             UpgradeKind kind)
         {
+            if (kind ==
+                UpgradeKind.ResourceGrade)
+            {
+                kind =
+                    UpgradeKind.StackCapacity;
+            }
+
             selectedUpgradeKind =
                 kind;
 
@@ -11467,12 +12364,6 @@ namespace CraftPeak
 
         private void BindUpgradeConfig()
         {
-            resourceUpgradeFormula =
-                BindFormula(
-                    "02. 자원 등급 강화",
-                    20,
-                    40);
-
             stackUpgradeFormula =
                 BindFormula(
                     "04. 인벤토리 적재 강화",
@@ -11490,7 +12381,7 @@ namespace CraftPeak
                 "강화 비용",
                 60,
                 new ConfigDescription(
-                    "수집량 배율 강화의 1단계 기본 비용입니다. x3, x4, x5 단계는 각각 기본 비용의 2배, 3배, 4배입니다.",
+                    "수집량 배율 강화 비용의 기준값입니다. 실제 비용은 기준값 x 다음 단계의 제곱으로 증가합니다.",
                     new AcceptableValueRange<int>(0, 100000)));
 
             sellValueUpgradeFormula =
@@ -11520,7 +12411,7 @@ namespace CraftPeak
                     "단계별 추가 비용",
                     costGrowth,
                     new ConfigDescription(
-                        "다음 단계마다 추가되는 비용입니다.",
+                        "강화 비용 계산에서 (다음 단계 - 1)의 제곱에 곱해지는 추가 비용입니다.",
                         new AcceptableValueRange<int>(0, 100000)))
             };
         }
@@ -11690,8 +12581,8 @@ namespace CraftPeak
                 incoming.Revision = Convert.ToInt32(revisionValue);
                 incoming.OwnerActor = ReadInt(props, UpgradeOwnerKey, 0);
                 incoming.RunId = ReadString(props, UpgradeRunIdKey);
-                incoming.ResourceLevel = Mathf.Clamp(
-                    ReadInt(props, UpgradeResourceKey, 0), 0, ResourceUpgradeMaximum);
+                incoming.ResourceLevel =
+                    ResourceUpgradeMaximum;
                 incoming.StackLevel = Mathf.Clamp(
                     ReadInt(props, UpgradeStackKey, 0), 0, StackUpgradeMaximum);
                 incoming.CampfireLevel = Mathf.Clamp(
@@ -11810,10 +12701,13 @@ namespace CraftPeak
             safe.Revision = Mathf.Max(0, safe.Revision);
             safe.OwnerActor = Mathf.Max(0, safe.OwnerActor);
             safe.RunId = safe.RunId ?? string.Empty;
-            safe.ResourceLevel = Mathf.Clamp(safe.ResourceLevel, 0, ResourceUpgradeMaximum);
+            safe.ResourceLevel = ResourceUpgradeMaximum;
             safe.StackLevel = Mathf.Clamp(safe.StackLevel, 0, StackUpgradeMaximum);
             safe.CampfireLevel = Mathf.Clamp(safe.CampfireLevel, 0, CampfireUpgradeMaximum);
-            safe.YieldMultiplier = Mathf.Clamp(safe.YieldMultiplier, 1, 5);
+            safe.YieldMultiplier = Mathf.Clamp(
+                safe.YieldMultiplier,
+                1,
+                YieldUpgradeMaximum + 1);
             safe.SellMultiplier = NormalizeSellMultiplier(
                 safe.SellMultiplier);
             safe.BaseStackCount =
@@ -11823,8 +12717,12 @@ namespace CraftPeak
                 new[] { 1, 1, 1 });
 
             for (int i = 0; i < safe.BaseCampfireMaterials.Length; i++)
+            {
                 safe.BaseCampfireMaterials[i] =
-                    Mathf.Max(0, safe.BaseCampfireMaterials[i]);
+                    Mathf.Max(
+                        0,
+                        safe.BaseCampfireMaterials[i]);
+            }
 
             return safe;
         }
@@ -11832,17 +12730,19 @@ namespace CraftPeak
         private static int NormalizeSellMultiplier(
             int value)
         {
-            if (value >= 16)
-                return 16;
-
-            if (value >= 8)
-                return 8;
-
-            if (value >= 4)
-                return 4;
-
-            if (value >= 2)
-                return 2;
+            for (int level =
+                     SellMultiplierByLevel.Length -
+                     1;
+                 level >= 0;
+                 level--)
+            {
+                if (value >=
+                    SellMultiplierByLevel[level])
+                {
+                    return
+                        SellMultiplierByLevel[level];
+                }
+            }
 
             return 1;
         }
@@ -11857,42 +12757,58 @@ namespace CraftPeak
                     StringComparison.Ordinal);
 
             if (PhotonNetwork.IsMasterClient &&
-                (int)Spawn.CurrentUpgradeGrade != upgradeState.ResourceLevel)
+                InventoryStack.MaximumStackCount !=
+                    CalculateEffectiveStackMaximum(
+                        upgradeState))
+            {
                 apply = true;
-
-            if (PhotonNetwork.IsMasterClient &&
-                InventoryStack.MaximumStackCount != CalculateEffectiveStackMaximum(upgradeState))
-                apply = true;
+            }
 
             if (apply)
-                ApplyUpgradeEffects("Verification");
+            {
+                ApplyUpgradeEffects(
+                    "Verification");
+            }
         }
 
         private void ApplyUpgradeEffects(string reason)
         {
-            ResourceYieldMultiplier = Mathf.Clamp(upgradeState.YieldMultiplier, 1, 5);
+            ResourceYieldMultiplier =
+                Mathf.Clamp(
+                    upgradeState.YieldMultiplier,
+                    1,
+                    YieldUpgradeMaximum + 1);
 
-            ApplyCampfireRequirements(CalculateEffectiveCampfireMaterials(upgradeState));
+            ApplyCampfireRequirements(
+                CalculateEffectiveCampfireMaterials(
+                    upgradeState));
 
             if (PhotonNetwork.IsMasterClient)
             {
-                Spawn.SetUpgradeGrade(upgradeState.ResourceLevel);
-
                 SetConfigValue(
                     InventoryStack.Instance != null
                         ? InventoryStack.Instance.Config
                         : null,
                     InventoryMaximumDefinition,
-                    CalculateEffectiveStackMaximum(upgradeState));
+                    CalculateEffectiveStackMaximum(
+                        upgradeState));
             }
 
-            lastAppliedUpgradeRevision = upgradeState.Revision;
-            lastAppliedUpgradeRunId = upgradeState.RunId ?? string.Empty;
+            lastAppliedUpgradeRevision =
+                upgradeState.Revision;
+
+            lastAppliedUpgradeRunId =
+                upgradeState.RunId ??
+                string.Empty;
 
             Logger.LogDebug(
-                "Upgrade effects applied. Reason=" + reason +
-                " | Stack=" + CalculateEffectiveStackMaximum(upgradeState) +
-                " | Yield=x" + ResourceYieldMultiplier);
+                "Upgrade effects applied. Reason=" +
+                reason +
+                " | Stack=" +
+                CalculateEffectiveStackMaximum(
+                    upgradeState) +
+                " | Yield=x" +
+                ResourceYieldMultiplier);
         }
 
         private void RestoreBaseUpgradeEffects()
@@ -11900,14 +12816,17 @@ namespace CraftPeak
             ResourceYieldMultiplier = 1;
 
             if (!upgradeStateLoaded)
+            {
                 return;
+            }
 
-            ApplyCampfireRequirements(CloneIntArray(upgradeState.BaseCampfireMaterials));
+            ApplyCampfireRequirements(
+                CloneIntArray(
+                    upgradeState
+                        .BaseCampfireMaterials));
 
             if (PhotonNetwork.IsMasterClient)
             {
-                Spawn.SetUpgradeGrade(0);
-
                 SetConfigValue(
                     InventoryStack.Instance != null
                         ? InventoryStack.Instance.Config
@@ -11922,11 +12841,18 @@ namespace CraftPeak
 
         private static int CalculateEffectiveStackMaximum(UpgradeState value)
         {
-            int level = Mathf.Clamp(value.StackLevel, 0, StackUpgradeMaximum);
-            return Mathf.Clamp(
-                value.BaseStackCount + StackCapacityBonuses[level],
-                1,
-                100);
+            int level =
+                Mathf.Clamp(
+                    value.StackLevel,
+                    0,
+                    StackUpgradeMaximum);
+
+            return
+                Mathf.Clamp(
+                    value.BaseStackCount +
+                    StackCapacityBonuses[level],
+                    1,
+                    500);
         }
 
         private static int[] CalculateEffectiveCampfireMaterials(UpgradeState value)
@@ -12020,6 +12946,17 @@ namespace CraftPeak
             }
 
             UpgradeKind kind = (UpgradeKind)kindValue;
+            if (kind ==
+                UpgradeKind.ResourceGrade)
+            {
+                SendUpgradeResult(
+                    actor,
+                    false,
+                    "자원 등급 강화는 제거되었습니다.");
+
+                return;
+            }
+
             int current = GetUpgradeCurrentLevel(kind);
 
             if (current >= GetUpgradeMaximumLevel(kind))
@@ -12165,21 +13102,31 @@ namespace CraftPeak
             switch (kind)
             {
                 case UpgradeKind.ResourceGrade:
-                    value.ResourceLevel = Mathf.Min(ResourceUpgradeMaximum, value.ResourceLevel + 1);
+                    value.ResourceLevel =
+                        ResourceUpgradeMaximum;
                     break;
 
                 case UpgradeKind.StackCapacity:
-                    value.StackLevel = Mathf.Min(StackUpgradeMaximum, value.StackLevel + 1);
+                    value.StackLevel =
+                        Mathf.Min(
+                            StackUpgradeMaximum,
+                            value.StackLevel +
+                            1);
                     break;
 
                 case UpgradeKind.CampfireEfficiency:
-                    value.CampfireLevel = Mathf.Min(CampfireUpgradeMaximum, value.CampfireLevel + 1);
+                    value.CampfireLevel =
+                        Mathf.Min(
+                            CampfireUpgradeMaximum,
+                            value.CampfireLevel +
+                            1);
                     break;
 
                 case UpgradeKind.DoubleYield:
                     value.YieldMultiplier =
                         Mathf.Min(
-                            YieldUpgradeMaximum + 1,
+                            YieldUpgradeMaximum +
+                            1,
                             Mathf.Max(
                                 1,
                                 value.YieldMultiplier) +
@@ -12187,13 +13134,19 @@ namespace CraftPeak
                     break;
 
                 case UpgradeKind.SellValue:
-                    value.SellMultiplier =
+                    int currentLevel =
+                        GetSellUpgradeLevel(
+                            value.SellMultiplier);
+
+                    int nextLevel =
                         Mathf.Min(
-                            16,
-                            Mathf.Max(
-                                1,
-                                value.SellMultiplier) *
-                            2);
+                            SellValueUpgradeMaximum,
+                            currentLevel +
+                            1);
+
+                    value.SellMultiplier =
+                        SellMultiplierByLevel[
+                            nextLevel];
                     break;
             }
         }
@@ -12228,38 +13181,56 @@ namespace CraftPeak
 
 
 
+        private static int GetSellUpgradeLevel(
+            int multiplier)
+        {
+            int normalized =
+                NormalizeSellMultiplier(
+                    multiplier);
+
+            for (int level = 0;
+                 level <
+                     SellMultiplierByLevel.Length;
+                 level++)
+            {
+                if (SellMultiplierByLevel[level] ==
+                    normalized)
+                {
+                    return level;
+                }
+            }
+
+            return 0;
+        }
+
         private int GetUpgradeCurrentLevel(UpgradeKind kind)
         {
             switch (kind)
             {
                 case UpgradeKind.ResourceGrade:
-                    return upgradeState.ResourceLevel;
+                    return 0;
+
                 case UpgradeKind.StackCapacity:
                     return upgradeState.StackLevel;
+
                 case UpgradeKind.CampfireEfficiency:
                     return upgradeState.CampfireLevel;
+
                 case UpgradeKind.DoubleYield:
                     return
                         Mathf.Clamp(
-                            upgradeState.YieldMultiplier - 1,
+                            upgradeState.YieldMultiplier -
+                            1,
                             0,
                             YieldUpgradeMaximum);
 
                 case UpgradeKind.SellValue:
-                    switch (NormalizeSellMultiplier(
-                        upgradeState.SellMultiplier))
-                    {
-                        case 2:
-                            return 1;
-                        case 4:
-                            return 2;
-                        case 8:
-                            return 3;
-                        case 16:
-                            return 4;
-                        default:
-                            return 0;
-                    }
+                    return
+                        Mathf.Clamp(
+                            GetSellUpgradeLevel(
+                                upgradeState.SellMultiplier),
+                            0,
+                            SellValueUpgradeMaximum);
 
                 default:
                     return 0;
@@ -12271,11 +13242,14 @@ namespace CraftPeak
             switch (kind)
             {
                 case UpgradeKind.ResourceGrade:
-                    return ResourceUpgradeMaximum;
+                    return 0;
+
                 case UpgradeKind.StackCapacity:
                     return StackUpgradeMaximum;
+
                 case UpgradeKind.CampfireEfficiency:
                     return CampfireUpgradeMaximum;
+
                 case UpgradeKind.DoubleYield:
                     return YieldUpgradeMaximum;
 
@@ -12291,10 +13265,9 @@ namespace CraftPeak
         {
             switch (kind)
             {
-                case UpgradeKind.ResourceGrade:
-                    return resourceUpgradeFormula;
                 case UpgradeKind.StackCapacity:
                     return stackUpgradeFormula;
+
                 case UpgradeKind.CampfireEfficiency:
                     return campfireUpgradeFormula;
 
@@ -12308,9 +13281,19 @@ namespace CraftPeak
 
         private int GetNextUpgradeCost(UpgradeKind kind)
         {
-            int nextLevel = GetUpgradeCurrentLevel(kind) + 1;
+            int nextLevel =
+                GetUpgradeCurrentLevel(
+                    kind) +
+                1;
 
-            if (kind == UpgradeKind.CampfireEfficiency)
+            if (kind ==
+                UpgradeKind.ResourceGrade)
+            {
+                return 0;
+            }
+
+            if (kind ==
+                UpgradeKind.CampfireEfficiency)
             {
                 CampfireBuildRecipe campfire =
                     GetNextCampfireRecipe();
@@ -12321,7 +13304,8 @@ namespace CraftPeak
                         : 0;
             }
 
-            if (kind == UpgradeKind.DoubleYield)
+            if (kind ==
+                UpgradeKind.DoubleYield)
             {
                 int yieldBaseCost =
                     doubleYieldCostConfig != null
@@ -12330,43 +13314,70 @@ namespace CraftPeak
                             doubleYieldCostConfig.Value)
                         : 60;
 
-                return
-                    yieldBaseCost *
+                int safeLevel =
                     Mathf.Clamp(
                         nextLevel,
                         1,
                         YieldUpgradeMaximum);
+
+                return
+                    yieldBaseCost *
+                    safeLevel *
+                    safeLevel;
             }
 
-            UpgradeFormulaConfig formula = GetUpgradeFormula(kind);
-            int baseCost = formula != null && formula.BaseCost != null
-                ? Mathf.Max(0, formula.BaseCost.Value)
-                : 0;
-            int growth = formula != null && formula.CostGrowth != null
-                ? Mathf.Max(0, formula.CostGrowth.Value)
-                : 0;
+            UpgradeFormulaConfig formula =
+                GetUpgradeFormula(
+                    kind);
 
-            return baseCost + growth * Mathf.Max(0, nextLevel - 1);
+            int baseCost =
+                formula != null &&
+                formula.BaseCost != null
+                    ? Mathf.Max(
+                        0,
+                        formula.BaseCost.Value)
+                    : 0;
+
+            int growth =
+                formula != null &&
+                formula.CostGrowth != null
+                    ? Mathf.Max(
+                        0,
+                        formula.CostGrowth.Value)
+                    : 0;
+
+            int step =
+                Mathf.Max(
+                    0,
+                    nextLevel -
+                    1);
+
+            return
+                baseCost +
+                growth *
+                step *
+                step;
         }
 
         internal string GetUpgradeDisplayName(UpgradeKind kind)
         {
             switch (kind)
             {
-                case UpgradeKind.ResourceGrade:
-                    return "자원 등급";
                 case UpgradeKind.StackCapacity:
                     return "인벤토리 적재량";
+
                 case UpgradeKind.CampfireEfficiency:
                     return "다음 모닥불 제작";
+
                 case UpgradeKind.DoubleYield:
                     return "수집량 배율";
 
                 case UpgradeKind.SellValue:
                     return "아이템 판매 수익";
 
+                case UpgradeKind.ResourceGrade:
                 default:
-                    return "알 수 없는 강화";
+                    return "사용하지 않는 강화";
             }
         }
 
@@ -12374,24 +13385,29 @@ namespace CraftPeak
         {
             switch (kind)
             {
-                case UpgradeKind.ResourceGrade:
-                    return "현재 해금 등급: " + GetResourceGradeName(upgradeState.ResourceLevel);
-
                 case UpgradeKind.StackCapacity:
-                    return "현재 최대 적재량: " + CalculateEffectiveStackMaximum(upgradeState) + "개";
+                    return
+                        "현재 최대 적재량: " +
+                        CalculateEffectiveStackMaximum(
+                            upgradeState) +
+                        "개";
 
                 case UpgradeKind.CampfireEfficiency:
-                    return "완성된 다음 모닥불: " +
-                           upgradeState.CampfireLevel +
-                           "/4";
+                    return
+                        "완성된 다음 모닥불: " +
+                        upgradeState.CampfireLevel +
+                        "/4";
 
                 case UpgradeKind.DoubleYield:
-                    return "현재 수집량: x" + upgradeState.YieldMultiplier;
+                    return
+                        "현재 수집량: x" +
+                        upgradeState.YieldMultiplier;
 
                 case UpgradeKind.SellValue:
-                    return "현재 판매 수익: 기본 판매가 x" +
-                           NormalizeSellMultiplier(
-                               upgradeState.SellMultiplier);
+                    return
+                        "현재 판매 수익: 기본 판매가 x" +
+                        NormalizeSellMultiplier(
+                            upgradeState.SellMultiplier);
 
                 default:
                     return string.Empty;
@@ -14320,6 +15336,383 @@ namespace CraftPeak
                  temp.itemSlotID == slot.itemSlotID);
         }
 
+
+        private static bool TrySelectSynthesisOutput(
+            global::Player requester,
+            SynthesisRecipe recipe,
+            out ushort outputId)
+        {
+            outputId = 0;
+
+            if (requester == null ||
+                recipe == null ||
+                recipe.OutputItemIds == null ||
+                recipe.OutputItemIds.Length ==
+                    0)
+            {
+                return false;
+            }
+
+            List<ushort> availableOutputs =
+                new List<ushort>();
+
+            for (int i = 0;
+                 i <
+                     recipe.OutputItemIds.Length;
+                 i++)
+            {
+                ushort candidate =
+                    recipe.OutputItemIds[i];
+
+                if (candidate != 0 &&
+                    requester.HasEmptySlot(
+                        candidate))
+                {
+                    availableOutputs.Add(
+                        candidate);
+                }
+            }
+
+            if (availableOutputs.Count ==
+                0)
+            {
+                return false;
+            }
+
+            outputId =
+                availableOutputs[
+                    UnityEngine.Random.Range(
+                        0,
+                        availableOutputs.Count)];
+
+            return true;
+        }
+
+        private void ProcessSynthesisRequestOnHost(
+            int actorNumber,
+            object[] payload)
+        {
+            if (!PhotonNetwork.IsMasterClient)
+            {
+                return;
+            }
+
+            if (!PhotonNetwork.InRoom ||
+                !IsGameplayScene())
+            {
+                SendSynthesisResult(
+                    actorNumber,
+                    false,
+                    false,
+                    0,
+                    "현재는 합성할 수 없습니다.");
+
+                return;
+            }
+
+            if (payload == null ||
+                payload.Length <
+                    1)
+            {
+                SendSynthesisResult(
+                    actorNumber,
+                    false,
+                    false,
+                    0,
+                    "잘못된 합성 요청입니다.");
+
+                return;
+            }
+
+            double now =
+                PhotonNetwork.Time;
+
+            double previousRequest;
+
+            if (lastSynthesisRequestAtByActor
+                    .TryGetValue(
+                        actorNumber,
+                        out previousRequest) &&
+                now -
+                    previousRequest <
+                MinimumRequestIntervalSeconds)
+            {
+                SendSynthesisResult(
+                    actorNumber,
+                    false,
+                    false,
+                    0,
+                    "합성 요청이 너무 빠릅니다.");
+
+                return;
+            }
+
+            lastSynthesisRequestAtByActor[
+                actorNumber] =
+                    now;
+
+            int recipeIndex;
+
+            try
+            {
+                recipeIndex =
+                    Convert.ToInt32(
+                        payload[0]);
+            }
+            catch (Exception)
+            {
+                SendSynthesisResult(
+                    actorNumber,
+                    false,
+                    false,
+                    0,
+                    "합성 단계 번호를 해석하지 못했습니다.");
+
+                return;
+            }
+
+            EnsureSynthesisRecipesBuilt();
+
+            if (recipeIndex <
+                    0 ||
+                recipeIndex >=
+                    SynthesisRecipes.Count)
+            {
+                SendSynthesisResult(
+                    actorNumber,
+                    false,
+                    false,
+                    0,
+                    "등록되지 않은 합성식입니다.");
+
+                return;
+            }
+
+            global::Player requester =
+                PlayerHandler.GetPlayer(
+                    actorNumber);
+
+            if (requester == null)
+            {
+                SendSynthesisResult(
+                    actorNumber,
+                    false,
+                    false,
+                    0,
+                    "플레이어를 찾지 못했습니다.");
+
+                return;
+            }
+
+            SynthesisRecipe recipe =
+                SynthesisRecipes[
+                    recipeIndex];
+
+            ushort outputId;
+
+            if (!TrySelectSynthesisOutput(
+                    requester,
+                    recipe,
+                    out outputId))
+            {
+                SendSynthesisResult(
+                    actorNumber,
+                    false,
+                    false,
+                    0,
+                    "합성 결과를 받을 인벤토리 공간이 없습니다.");
+
+                return;
+            }
+
+            CraftRecipe temporaryRecipe =
+                new CraftRecipe();
+
+            for (int i = 0;
+                 i <
+                     recipe.Ingredients.Count;
+                 i++)
+            {
+                IngredientCost cost =
+                    recipe.Ingredients[i];
+
+                temporaryRecipe
+                    .Ingredients
+                    .Add(
+                        new IngredientCost(
+                            cost.ItemId,
+                            cost.Count));
+            }
+
+            CraftConsumptionPlan plan;
+            string missingMessage;
+
+            if (!TryBuildCraftConsumptionPlan(
+                    temporaryRecipe,
+                    out plan,
+                    out missingMessage,
+                    requester))
+            {
+                SendSynthesisResult(
+                    actorNumber,
+                    false,
+                    false,
+                    outputId,
+                    missingMessage);
+
+                return;
+            }
+
+            List<ConsumedSelectedSlot>
+                consumedSlots;
+
+            if (!TryConsumePlan(
+                    plan,
+                    out consumedSlots))
+            {
+                SendSynthesisResult(
+                    actorNumber,
+                    false,
+                    false,
+                    outputId,
+                    "합성 재료 소비 중 인벤토리가 변경되었습니다. 다시 시도하세요.");
+
+                return;
+            }
+
+            BroadcastConsumedSelectedSlots(
+                consumedSlots);
+
+            ItemSlot grantedSlot;
+
+            bool granted =
+                requester.AddItem(
+                    outputId,
+                    null,
+                    out grantedSlot);
+
+            bool inventoryOrHandGrant =
+                granted &&
+                IsRealCraftGrantSlot(
+                    requester,
+                    grantedSlot,
+                    outputId);
+
+            bool grantedToHand =
+                inventoryOrHandGrant &&
+                IsTemporaryCraftGrantSlot(
+                    requester,
+                    grantedSlot);
+
+            if (!inventoryOrHandGrant)
+            {
+                SendSynthesisResult(
+                    actorNumber,
+                    true,
+                    false,
+                    outputId,
+                    "합성 결과 지급 중 오류가 발생했습니다. 재료는 복구되지 않았습니다.");
+
+                Logger.LogError(
+                    "Synthesis output delivery failed. Actor=" +
+                    actorNumber +
+                    " | Recipe=" +
+                    recipeIndex +
+                    " | OutputID=" +
+                    outputId +
+                    " | Granted=" +
+                    granted +
+                    " | GrantedSlot=" +
+                    (
+                        grantedSlot != null
+                            ? grantedSlot.itemSlotID
+                                .ToString()
+                            : "<null>"
+                    ));
+
+                return;
+            }
+
+            if (grantedToHand &&
+                requester.photonView != null &&
+                requester.photonView.IsMine)
+            {
+                StartCoroutine(
+                    EquipCraftedTempHandLocally(
+                        requester,
+                        outputId));
+            }
+
+            SendSynthesisResult(
+                actorNumber,
+                true,
+                true,
+                outputId,
+                GetIngredientDisplayName(
+                    outputId) +
+                " 합성에 성공했습니다.");
+
+            Logger.LogInfo(
+                "Synthesis succeeded. Actor=" +
+                actorNumber +
+                " | Recipe=" +
+                recipeIndex +
+                " | OutputID=" +
+                outputId +
+                " | Destination=" +
+                (
+                    grantedToHand
+                        ? "SelectedHand250"
+                        : "Inventory"
+                ));
+        }
+
+        private void SendSynthesisResult(
+            int targetActor,
+            bool materialsConsumed,
+            bool success,
+            ushort outputId,
+            string message)
+        {
+            object[] payload =
+            {
+                materialsConsumed,
+                success,
+                (int)outputId,
+                message ??
+                string.Empty
+            };
+
+            if (PhotonNetwork.LocalPlayer !=
+                    null &&
+                PhotonNetwork.LocalPlayer
+                    .ActorNumber ==
+                    targetActor)
+            {
+                HandleSynthesisResult(
+                    payload);
+
+                return;
+            }
+
+            RaiseEventOptions options =
+                new RaiseEventOptions
+                {
+                    TargetActors =
+                        new[]
+                        {
+                            targetActor
+                        }
+                };
+
+            PhotonNetwork.RaiseEvent(
+                SynthesisResultEventCode,
+                payload,
+                options,
+                SendOptions.SendReliable);
+        }
+
+
         private void ProcessCraftRequestOnHost(int actorNumber, object[] payload)
         {
             if (!PhotonNetwork.IsMasterClient)
@@ -15482,14 +16875,25 @@ namespace CraftPeak
             List<LiteTabView> tabs =
                 new List<LiteTabView>();
 
+            HubTab[] tabValues =
+            {
+                HubTab.Description,
+                HubTab.Upgrade,
+                HubTab.Craft,
+                HubTab.Synthesis,
+                HubTab.Sell,
+                HubTab.Parts
+            };
+
             string[] tabNames =
             {
                 "설명",
                 "강화",
                 "제작",
+                "합성",
                 "판매",
                 "부품"
-                // HubTab.Developer는 tabNames에 포함하지 않아 탭 버튼을 생성하지 않습니다.
+                // HubTab.Developer는 tabValues에 포함하지 않아 탭 버튼을 생성하지 않습니다.
             };
 
             for (int i = 0;
@@ -15497,7 +16901,7 @@ namespace CraftPeak
                  i++)
             {
                 HubTab tab =
-                    (HubTab)i;
+                    tabValues[i];
 
                 HubTab captured =
                     tab;
@@ -15530,9 +16934,9 @@ namespace CraftPeak
                         1f),
                     new Vector2(
                         0f,
-                        -190f -
+                        -172f -
                         i *
-                        78f),
+                        66f),
                     new Vector2(
                         168f,
                         66f));
@@ -15577,7 +16981,7 @@ namespace CraftPeak
                     1f),
                 new Vector2(
                     0f,
-                    -552f),
+                    -574f),
                 new Vector2(
                     165f,
                     24f));
@@ -15645,8 +17049,8 @@ namespace CraftPeak
 
                 float yPosition =
                     firstRow
-                        ? -584f
-                        : -618f;
+                        ? -606f
+                        : -638f;
 
                 float width =
                     firstRow
@@ -16265,16 +17669,22 @@ namespace CraftPeak
                 case HubTab.Upgrade:
                     if (rowIndex >=
                             0 &&
-                        rowIndex <=
-                            (int)UpgradeKind.SellValue)
+                        rowIndex <
+                            VisibleUpgradeKinds.Length)
                     {
                         SelectUpgradeKind(
-                            (UpgradeKind)rowIndex);
+                            VisibleUpgradeKinds[
+                                rowIndex]);
                     }
                     break;
 
                 case HubTab.Craft:
                     SelectCraftCard(
+                        rowIndex);
+                    break;
+
+                case HubTab.Synthesis:
+                    SelectSynthesisRecipe(
                         rowIndex);
                     break;
 
@@ -16308,6 +17718,10 @@ namespace CraftPeak
                     RequestCraft();
                     break;
 
+                case HubTab.Synthesis:
+                    RequestSynthesis();
+                    break;
+
                 case HubTab.Sell:
                     RequestSell();
                     break;
@@ -16328,51 +17742,47 @@ namespace CraftPeak
             {
                 case HubLanguage.Korean:
                     return
-                        "Craft PEAK는 PEAK의 등산을 자원 수집과 제작 중심의 크래프팅 게임으로 바꾸는 모드입니다. " +
-                        "게임 중 P키를 누르면 통합 상점이 열리며 설명, 강화, 제작, 판매, 부품 탭을 사용할 수 있습니다.\n\n" +
-                        "맵에 흩어진 자원을 모아 판매하면 파티 공유 돈을 얻습니다. 공유 돈과 재료는 강화, 장비 제작, " +
-                        "비행기 부품 구매에 함께 사용됩니다. 강화 탭에서 제작 등급을 Common에서 Normal, Rare, Unique, " +
-                        "Legendary 순서로 올려야 다음 단계의 자원과 제작식이 열립니다. 상위 제작품은 반드시 이전 단계 제작품을 재료로 요구합니다.\n\n" +
-                        "모닥불은 단순한 휴식 장소가 아니라 다음 세그먼트로 이동하기 위한 진행 트리거입니다. " +
-                        "해안, 열대/뿌리숲, 메사/고산지대, 칼데라에서는 현재 구간에 맞는 제작 등급과 비행기 부품이 필요합니다. " +
-                        "부품은 인벤토리에 들어가지 않고 Photon 방의 공동 진행 상태로 저장되며, 모닥불을 성공적으로 켤 때 사용 완료됩니다.\n\n" +
-                        "진행 순서는 해안 → 열대/뿌리숲 → 메사/고산지대 → 칼데라 → 가마 → 정상입니다. " +
-                        "가마에서 정상으로 갈 때는 모닥불과 비행기 부품을 사용하지 않습니다. 정상에 도착한 뒤 제작 탭에서 Legendary 재료가 들어가는 " +
-                        "가장 비싼 최종 조명탄을 제작하면 최종 탈출 신호가 완성됩니다.\n\n" +
-                        "핵심 흐름은 자원 수집 → 판매 → 강화와 제작 → 비행기 부품 구매 → 모닥불 점화 → 다음 구간 이동입니다.";
+                        "Craft PEAK는 PEAK의 등산을 자원 수집, 합성, 제작 중심으로 바꾸는 모드입니다. " +
+                        "게임 중 P키를 누르면 설명, 강화, 제작, 합성, 판매, 부품 탭을 사용할 수 있습니다.\n\n" +
+                        "맵에서는 나뭇가지, 돌, 소라고둥만 생성됩니다. 합성 탭에서 나뭇가지 + 돌 + 소라고둥을 합성하면 " +
+                        "망원경, 빙봉, 나팔, 플라잉 디스크 중 하나가 무작위로 나옵니다. 네 종류를 각각 1개씩 합성하면 " +
+                        "가이드북 또는 스크롤이 나오고, 가이드북 + 스크롤을 합성하면 괴상 버섯이 나옵니다. " +
+                        "괴상 버섯 10개를 합성하면 이상한 보석을 얻습니다.\n\n" +
+                        "합성과 제작은 버튼을 누른 플레이어 본인의 일반 인벤토리, 가상 손 슬롯 250, 배낭 내부 재료만 사용합니다. " +
+                        "다른 플레이어의 아이템은 소비하지 않습니다.\n\n" +
+                        "강화 탭에는 인벤토리 적재량, 다음 모닥불 제작, 수집량 배율, 아이템 판매 수익만 표시됩니다. " +
+                        "적재량, 수집량, 판매 수익은 최대 10강이며 높은 단계일수록 비용이 빠르게 증가합니다. " +
+                        "다음 모닥불 제작은 기존처럼 4단계로 유지됩니다.\n\n" +
+                        "핵심 흐름은 일반 자원 수집 → 합성 → 판매와 제작 → 강화 및 비행기 부품 구매 → 모닥불 점화 → 다음 구간 이동입니다.";
 
                 case HubLanguage.Chinese:
                     return
-                        "Craft PEAK 将 PEAK 的攀登玩法改造成以资源收集和制作为核心的生存制作模式。游戏中按 P 可打开综合商店，使用说明、升级、制作、出售和部件标签。\n\n" +
-                        "收集地图中的资源并出售，可获得队伍共享资金。共享资金与材料用于升级、制作装备和购买飞机部件。必须在升级标签中按 Common、Normal、Rare、Unique、Legendary 的顺序提升制作等级，才能解锁后续资源与配方。高级物品会要求前一阶段的制作品作为材料。\n\n" +
-                        "篝火不仅是休息地点，也是前往下一区域的推进触发器。在海滩、热带/根系森林、台地/高山和火山口区域，需要满足当前区域对应的制作等级并拥有指定飞机部件。部件不会进入背包，而是保存为 Photon 房间的共享进度，并在成功点燃篝火时消耗。\n\n" +
-                        "推进顺序为海滩 → 热带/根系森林 → 台地/高山 → 火山口 → 熔炉 → 山顶。从熔炉前往山顶时不使用篝火或飞机部件。抵达山顶后，在制作标签中制作需要 Legendary 材料、价格最高的最终信号弹，即可完成最终逃脱信号。\n\n" +
-                        "核心流程：收集资源 → 出售 → 升级与制作 → 购买飞机部件 → 点燃篝火 → 前往下一区域。";
+                        "Craft PEAK 将 PEAK 的攀登改造成以资源收集、合成和制作为核心的模式。游戏中按 P 可使用说明、升级、制作、合成、出售和部件标签。\n\n" +
+                        "地图只生成树枝、石头和海螺。合成三种普通资源后，会随机得到双筒望远镜、冰棒、号角或飞盘。将这四种物品各合成 1 个，可随机得到指南书或卷轴。指南书与卷轴可合成怪异蘑菇，10 个怪异蘑菇可合成奇异宝石。\n\n" +
+                        "合成与制作只消耗操作玩家自己的普通背包栏位、虚拟手持栏位 250 和背包内部材料，不会使用其他玩家的物品。\n\n" +
+                        "升级标签只保留背包容量、后续篝火、采集倍率和出售收益。背包容量、采集倍率和出售收益最高为 10 级，后期费用增长更快；后续篝火仍保持 4 个阶段。";
 
                 case HubLanguage.Japanese:
                     return
-                        "Craft PEAKは、PEAKの登山を資源収集とクラフト中心のゲームへ変えるMODです。ゲーム中にPキーを押すと統合ショップが開き、説明・強化・クラフト・売却・部品タブを使用できます。\n\n" +
-                        "マップ上の資源を集めて売却すると、パーティー共有資金を獲得できます。共有資金と素材は、強化、装備のクラフト、飛行機部品の購入に使用します。強化タブでクラフト等級をCommon、Normal、Rare、Unique、Legendaryの順に上げると、次の資源とレシピが解放されます。上位の完成品には前段階の完成品が素材として必要です。\n\n" +
-                        "焚き火は休憩場所だけでなく、次の区間へ進むための進行トリガーです。海岸、熱帯/根の森、メサ/高山、カルデラでは、現在の区間に対応するクラフト等級と飛行機部品が必要です。部品はインベントリには入らず、Photonルームの共有進行状態として保存され、焚き火の点火成功時に使用済みになります。\n\n" +
-                        "進行順は海岸 → 熱帯/根の森 → メサ/高山 → カルデラ → 窯 → 山頂です。窯から山頂へ進む際は焚き火と飛行機部品を使用しません。山頂到達後、クラフトタブでLegendary素材を使う最も高価な最終フレアを作成すると、最終脱出信号が完成します。\n\n" +
-                        "基本の流れは、資源収集 → 売却 → 強化とクラフト → 飛行機部品購入 → 焚き火点火 → 次の区間へ移動、です。";
+                        "Craft PEAKは、PEAKの登山を資源収集・合成・クラフト中心のモードへ変えるMODです。ゲーム中にPキーを押すと、説明・強化・クラフト・合成・売却・部品タブを使用できます。\n\n" +
+                        "マップには枝、石、巻き貝だけが生成されます。3種類のコモン資源を合成すると、双眼鏡、ビン・ボン、ラッパ、フリスビーのいずれかがランダムで得られます。その4種類を各1個ずつ合成するとガイドブックまたは巻物、ガイドブックと巻物から奇妙なキノコ、奇妙なキノコ10個から不思議な宝石を作れます。\n\n" +
+                        "合成とクラフトは、操作したプレイヤー本人の通常スロット、仮想手スロット250、バックパック内部の素材だけを消費します。他のプレイヤーのアイテムは使用しません。\n\n" +
+                        "強化タブにはインベントリ容量、次の焚き火、収集倍率、売却利益のみ表示されます。容量・収集倍率・売却利益は最大10段階で、後半ほど費用が急増します。次の焚き火は従来どおり4段階です。";
 
                 case HubLanguage.French:
                     return
-                        "Craft PEAK transforme l’ascension de PEAK en un jeu de fabrication centré sur la collecte de ressources. Pendant une partie, appuyez sur P pour ouvrir la boutique unifiée et accéder aux onglets Description, Améliorations, Fabrication, Vente et Pièces.\n\n" +
-                        "Ramassez les ressources dispersées sur la carte puis vendez-les pour gagner de l’argent partagé par le groupe. Cet argent et les matériaux servent aux améliorations, à la fabrication d’équipement et à l’achat de pièces d’avion. Dans l’onglet Améliorations, augmentez le niveau de fabrication dans l’ordre Common, Normal, Rare, Unique puis Legendary afin de débloquer les ressources et recettes suivantes. Les objets avancés exigent des objets fabriqués au niveau précédent.\n\n" +
-                        "Les feux de camp ne sont pas seulement des lieux de repos : ils déclenchent la progression vers le segment suivant. Sur la Plage, dans les Tropiques/Forêt de racines, sur le Mesa/Alpin et dans la Caldeira, vous devez posséder le niveau de fabrication et la pièce d’avion correspondant au segment actuel. Les pièces ne vont pas dans l’inventaire ; elles sont enregistrées dans l’état partagé du salon Photon et sont consommées lorsqu’un feu de camp est allumé avec succès.\n\n" +
-                        "L’ordre de progression est Plage → Tropiques/Forêt de racines → Mesa/Alpin → Caldeira → Four → Sommet. Le passage du Four au Sommet n’utilise ni feu de camp ni pièce d’avion. Une fois au Sommet, fabriquez dans l’onglet Fabrication la fusée finale la plus coûteuse, qui exige des matériaux Legendary, pour terminer le signal d’évacuation.\n\n" +
-                        "Boucle principale : collecter → vendre → améliorer et fabriquer → acheter les pièces d’avion → allumer le feu de camp → rejoindre le segment suivant.";
+                        "Craft PEAK transforme l’ascension de PEAK en un mode centré sur la collecte, la synthèse et la fabrication. Appuyez sur P pendant une partie pour accéder aux onglets Description, Améliorations, Fabrication, Synthèse, Vente et Pièces.\n\n" +
+                        "La carte ne génère que des branches, des pierres et des conques. La synthèse de ces trois ressources donne aléatoirement des jumelles, un Bing Bong, un clairon ou un frisbee. La synthèse d’un exemplaire de chacun de ces quatre objets donne un guide ou un parchemin. Un guide et un parchemin donnent un champignon étrange, puis 10 champignons étranges donnent une gemme étrange.\n\n" +
+                        "La synthèse et la fabrication ne consomment que les matériaux du joueur qui appuie sur le bouton : emplacements normaux, emplacement de main virtuel 250 et contenu du sac à dos. Les objets des autres joueurs ne sont pas utilisés.\n\n" +
+                        "L’onglet Améliorations conserve uniquement la capacité d’inventaire, le prochain feu de camp, le rendement de collecte et la valeur de vente. La capacité, le rendement et la vente montent jusqu’au niveau 10 avec des coûts de plus en plus élevés. Le prochain feu de camp reste limité à 4 étapes.";
 
                 case HubLanguage.English:
                 default:
                     return
-                        "Craft PEAK turns PEAK’s climb into a crafting game focused on gathering resources. Press P during a run to open the unified shop and use the Description, Upgrades, Crafting, Sell, and Parts tabs.\n\n" +
-                        "Gather resources across the map and sell them to earn party-shared money. Shared money and materials are used for upgrades, equipment crafting, and aircraft parts. In the Upgrades tab, raise the crafting grade in order from Common to Normal, Rare, Unique, and Legendary to unlock later resources and recipes. Higher-tier items require crafted items from the previous tier as ingredients.\n\n" +
-                        "Campfires are not only rest points; they trigger progression to the next segment. At the Beach, Tropics/Roots, Mesa/Alpine, and Caldera, you need the crafting grade and aircraft part assigned to the current segment. Parts do not enter the inventory. They are stored as shared Photon-room progression and are consumed when the campfire is lit successfully.\n\n" +
-                        "The route is Beach → Tropics/Roots → Mesa/Alpine → Caldera → Kiln → Peak. Moving from the Kiln to the Peak does not use a campfire or aircraft part. After reaching the Peak, craft the most expensive final flare with Legendary materials in the Crafting tab to complete the escape signal.\n\n" +
-                        "Core loop: gather resources → sell → upgrade and craft → purchase aircraft parts → light the campfire → move to the next segment.";
+                        "Craft PEAK turns PEAK’s climb into a mode focused on gathering, synthesis, and crafting. Press P during a run to use the Description, Upgrades, Crafting, Synthesis, Sell, and Parts tabs.\n\n" +
+                        "Only sticks, stones, and conches spawn on the map. Synthesizing one of each produces a random Binoculars, Bing Bong, Bugle, or Frisbee. Synthesizing one of each of those four items produces a Guidebook or Scroll. A Guidebook plus a Scroll produces a Weird Shroom, and 10 Weird Shrooms produce a Strange Gem.\n\n" +
+                        "Synthesis and crafting consume only the inventory of the player who presses the button: normal slots, virtual hand slot 250, and backpack contents. Other players’ items are not used.\n\n" +
+                        "The Upgrades tab now contains only Inventory Capacity, Next Campfire, Gather Yield, and Sale Value. Inventory Capacity, Gather Yield, and Sale Value can reach level 10 with sharply increasing late-game costs. Next Campfire remains at four stages.";
             }
         }
 
@@ -17812,6 +19222,10 @@ namespace CraftPeak
                         RefreshCraft();
                         break;
 
+                    case HubTab.Synthesis:
+                        RefreshSynthesis();
+                        break;
+
                     case HubTab.Sell:
                         RefreshSell();
                         break;
@@ -17877,6 +19291,7 @@ namespace CraftPeak
             private void RefreshUpgrade()
             {
                 PrepareInteractiveTab();
+
                 SetTextIfChanged(
                     title,
                     "강화");
@@ -17886,13 +19301,13 @@ namespace CraftPeak
                      i++)
                 {
                     bool active =
-                        i <=
-                        (int)UpgradeKind.SellValue;
+                        i <
+                        VisibleUpgradeKinds.Length;
 
                     UpgradeKind kind =
                         active
-                            ? (UpgradeKind)i
-                            : UpgradeKind.ResourceGrade;
+                            ? VisibleUpgradeKinds[i]
+                            : UpgradeKind.StackCapacity;
 
                     rows[i].Refresh(
                         active,
@@ -18048,6 +19463,77 @@ namespace CraftPeak
                         PendingRequest.Craft
                         ? "처리 중..."
                         : "제작 시도");
+            }
+
+
+            private void RefreshSynthesis()
+            {
+                PrepareInteractiveTab();
+
+                SetTextIfChanged(
+                    title,
+                    "합성");
+
+                SynthesisRecipe selected =
+                    owner
+                        .SelectedSynthesisRecipe;
+
+                for (int i = 0;
+                     i < rows.Count;
+                     i++)
+                {
+                    SynthesisRecipe recipe =
+                        owner
+                            .GetSynthesisRecipeAtRow(
+                                i);
+
+                    rows[i].Refresh(
+                        recipe != null,
+                        recipe != null &&
+                        selected != null &&
+                        recipe.Index ==
+                            selected.Index,
+                        owner.BuildSynthesisRowText(
+                            recipe));
+                }
+
+                SetActiveIfChanged(
+                    page.gameObject,
+                    false);
+
+                SetActiveIfChanged(
+                    previous.gameObject,
+                    false);
+
+                SetActiveIfChanged(
+                    next.gameObject,
+                    false);
+
+                bool ready;
+
+                SetTextIfChanged(
+                    detail,
+                    owner.BuildSynthesisDetailText(
+                        selected,
+                        out ready));
+
+                SetTextIfChanged(
+                    status,
+                    owner.synthesisStatus);
+
+                SetInteractableIfChanged(
+                    action,
+                    selected != null &&
+                    ready &&
+                    owner.pendingRequest ==
+                        PendingRequest.None);
+
+                SetTextIfChanged(
+                    actionLabel,
+                    owner.pendingRequest ==
+                        PendingRequest.Synthesis
+                        ? "처리 중..."
+                        : "합성 시도");
             }
 
             private void RefreshSell()
@@ -18774,7 +20260,7 @@ namespace CraftPeak
                         ? ToCompatibilityKind(
                             CraftHub.Instance
                                 .SelectedUpgradeKind)
-                        : UpgradeKind.ResourceGrade;
+                        : UpgradeKind.StackCapacity;
             }
         }
 
